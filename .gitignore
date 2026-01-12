@@ -53,3 +53,7 @@ ENV/
 # Logs
 *.log
 logs/
+
+# Files with embedded secrets (API keys in documentation)
+ONBOARDING_SETUP_STATUS.md
+.github/workflows/daily-monitor.yml
