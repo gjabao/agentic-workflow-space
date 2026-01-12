@@ -1,0 +1,19 @@
+# Modal Cloud Workflows Dependencies
+# These are automatically installed in Modal containers
+
+# Core
+modal>=0.63.0
+
+# API Requests
+requests>=2.31.0
+
+# Google API
+google-api-python-client>=2.100.0
+google-auth-httplib2>=0.1.1
+google-auth-oauthlib>=1.1.0
+
+# Data Processing (optional, for future workflows)
+pandas>=2.0.0
+
+# Note: These dependencies are specified in each workflow's image definition
+# You don't need to pip install them locally unless testing

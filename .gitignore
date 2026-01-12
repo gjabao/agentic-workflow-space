@@ -1,0 +1,55 @@
+# DO Architecture - Git Ignore Rules
+
+# Temporary files (regenerable)
+.tmp/
+*.tmp
+*.temp
+
+# Environment variables and secrets
+# NOTE: .env contains API keys and should NOT be pushed to GitHub
+.env
+.env.local
+.env.*.local
+
+# Google OAuth credentials
+# NOTE: These contain secrets and should NOT be pushed to GitHub
+credentials.json
+token.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+logs/
