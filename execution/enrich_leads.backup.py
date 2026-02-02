@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
 """
-Enrich Leads Script v2.2 - Email-First + Row Duplication
-Enriches a Google Sheet with ALL Decision Makers by duplicating rows for each DM found.
+Enrich Leads Script v2.0 - Email-First Approach
+Enriches a Google Sheet with Decision Maker info, Emails, and Personalized Messages.
 
-WORKFLOW (v2.2):
+NEW WORKFLOW (v2.0 - Based on Crunchbase Scraper):
 1. Find company website (from sheet or Google Search with 3-attempt strategy)
-2. Find ALL emails at company (up to 10) via AnyMailFinder Company API
+2. Find ALL emails at company (up to 20) via AnyMailFinder Company API
 3. Extract names from emails (firstname.lastname@ → "Firstname Lastname")
-4. Search LinkedIn profiles by name + company using RapidAPI (2-attempt strategy)
+4. Search LinkedIn profiles by name + company using RapidAPI (3-attempt strategy)
 5. Validate decision-maker based on title keywords
-6. Update FIRST DM in existing row
-7. Duplicate row for EACH additional DM (preserves all company data)
+6. Output decision-makers with verified emails to Google Sheet
 
 KEY IMPROVEMENTS:
-- ❌ OLD v1.0: Find decision-maker first → search email (5-10% success)
-- ✅ v2.0: Find emails first → extract names → validate (200-300% success)
-- ✅ v2.1: Performance optimization (6x faster, 8-10s per company)
-- ✅ v2.2: Duplicate rows for ALL decision-makers (no data loss)
+- ❌ OLD: Find decision-maker first → search email (5-10% success)
+- ✅ NEW: Find emails first → extract names → validate (200-300% success)
 """
 
 import os
@@ -267,41 +264,23 @@ class RapidAPIGoogleSearch:
         """Extract job title from search result"""
         combined = title + ' ' + snippet
 
-        # CRITICAL FIX: More aggressive patterns for LinkedIn titles
-        # LinkedIn format: "Name - Job Title at Company" or "Name | Job Title at Company"
         patterns = [
-            # Pattern 1: "Name - Job Title at Company" (most common)
-            r' - ([^-|·@]+?)\s+(?:at|@)\s+',
-
-            # Pattern 2: "Name | Job Title at Company"
-            r' \| ([^-|·@]+?)\s+(?:at|@)\s+',
-
-            # Pattern 3: "Name · Job Title at Company"
-            r' · ([^-|·@]+?)\s+(?:at|@)\s+',
-
-            # Pattern 4: Just after " - " before anything (fallback)
-            r' - ([^|·@]+?)(?:\s*$|\s*-)',
-
-            # Pattern 5: Keyword-based extraction (C-level, founder, director, etc.)
-            r'\b((?:Co-)?(?:Founder|CEO|CFO|CTO|COO|CMO|Chief\s+\w+\s+Officer|President|Vice\s+President|VP|Director|Head\s+of\s+\w+|Managing\s+(?:Director|Partner)|Partner|Executive\s+\w+)(?:\s+(?:and|&)\s+(?:Co-)?(?:Founder|CEO|CFO|CTO|COO|CMO|Chief\s+\w+\s+Officer))?)\b',
+            r' - ([^-|·@,]+?)(?:\s+at\s+|\s+@\s+|\s*-\s*)',
+            r' \| ([^-|·@,]+?)(?:\s+at\s+|\s+@\s+)',
+            r' · ([^-|·@,]+?)(?:\s+at\s+|\s+@\s+)',
+            r', ([^,]+?)(?:\s+at\s+|\s+@\s+)',
+            r'\b((?:Chief|Senior|Vice President|VP|Director|Manager|Owner|Founder|Co-Founder|CEO|COO|CFO|CTO|President|Partner|Executive)\s*(?:of|at|for|&)?\s*[A-Za-z\s]{0,30})\b',
         ]
 
         for pattern in patterns:
             match = re.search(pattern, combined, re.IGNORECASE)
             if match:
                 title_text = match.group(1).strip()
-
-                # Clean up extracted title
-                title_text = re.sub(r'\s+', ' ', title_text)
-                title_text = re.sub(r'[^\w\s&/-]$', '', title_text)
-
-                # Validate: must be 3-100 chars, no URLs
                 if 3 <= len(title_text) <= 100:
+                    title_text = re.sub(r'\s+', ' ', title_text)
+                    title_text = re.sub(r'[^\w\s&-]$', '', title_text)
                     if not re.search(r'(http|www\.|\.com|linkedin)', title_text, re.IGNORECASE):
-                        # CRITICAL: Filter out company names (appears at end of pattern)
-                        # If title matches company name pattern, skip it
-                        if not self._is_company_match(title_text, "", threshold=0.8):
-                            return title_text.strip()
+                        return title_text.strip()
 
         return ""
 
@@ -479,29 +458,6 @@ class LeadEnricher:
 
         return domain
 
-    def validate_email_domain(self, email: str, expected_domain: str) -> bool:
-        """
-        Validate that email domain matches expected company domain.
-
-        Args:
-            email: Email address to validate
-            expected_domain: Expected domain (e.g., "ae.studio")
-
-        Returns:
-            True if email domain matches expected domain
-        """
-        if not email or '@' not in email:
-            return False
-
-        # Extract domain from email
-        email_domain = email.split('@')[1].lower()
-
-        # Clean expected domain (remove www.)
-        expected_clean = expected_domain.lower().replace('www.', '')
-
-        # Exact match required
-        return email_domain == expected_clean
-
     def extract_contact_from_email(self, email: str) -> Tuple[str, bool, float]:
         """
         Extract name from email and classify as generic/personal
@@ -618,17 +574,6 @@ class LeadEnricher:
         ]
 
         has_exclude_keyword = any(kw in job_title_lower for kw in exclude_keywords)
-
-        # CRITICAL FIX: Exclude if job title is ONLY a company name (no actual title)
-        # Examples to reject: "Ava Labs", "Wave", "Unstoppable Domains"
-        # This happens when LinkedIn title extraction fails and returns company name instead
-        if not has_dm_keyword:
-            return False
-
-        # If title is too short (1-2 words) and has no DM keywords, likely a company name
-        words = job_title.split()
-        if len(words) <= 2 and not has_dm_keyword:
-            return False
 
         return has_dm_keyword and not has_exclude_keyword
 
@@ -850,60 +795,6 @@ class LeadEnricher:
         body = {"requests": requests}
         service.spreadsheets().batchUpdate(spreadsheetId=sheet_id, body=body).execute()
 
-    def insert_new_rows(self, sheet_id: str, grid_id: int, after_row_index: int, num_rows: int):
-        """Insert new blank rows after a specific row index."""
-        creds = self.get_credentials()
-        service = build('sheets', 'v4', credentials=creds)
-
-        requests = [{
-            "insertDimension": {
-                "range": {
-                    "sheetId": grid_id,
-                    "dimension": "ROWS",
-                    "startIndex": after_row_index + 1,
-                    "endIndex": after_row_index + 1 + num_rows
-                },
-                "inheritFromBefore": True  # Copy formatting from row above
-            }
-        }]
-
-        body = {"requests": requests}
-        service.spreadsheets().batchUpdate(spreadsheetId=sheet_id, body=body).execute()
-
-    def duplicate_row_data(self, sheet_id: str, grid_id: int, target_rows: List[int], headers: List[str], original_data: Dict):
-        """Duplicate all original company data to new rows."""
-        creds = self.get_credentials()
-        service = build('sheets', 'v4', credentials=creds)
-
-        requests = []
-
-        for target_row in target_rows:
-            # Copy all original columns (not DM columns) to the new row
-            for col_idx, header in enumerate(headers):
-                # Skip DM columns
-                if header in ['First Name', 'Last Name', 'Email', 'LinkedIn URL', 'Job Title']:
-                    continue
-
-                value = original_data.get(header, '')
-
-                requests.append({
-                    "updateCells": {
-                        "rows": [{"values": [{"userEnteredValue": {"stringValue": str(value)}}]}],
-                        "fields": "userEnteredValue",
-                        "range": {
-                            "sheetId": grid_id,
-                            "startRowIndex": target_row,
-                            "endRowIndex": target_row + 1,
-                            "startColumnIndex": col_idx,
-                            "endColumnIndex": col_idx + 1
-                        }
-                    }
-                })
-
-        if requests:
-            body = {"requests": requests}
-            service.spreadsheets().batchUpdate(spreadsheetId=sheet_id, body=body).execute()
-
     def enrich_single_company(self, company_name: str, website: str = None) -> List[Dict]:
         """
         Email-first enrichment workflow for a single company:
@@ -934,29 +825,15 @@ class LeadEnricher:
             logger.info(f"  ⊘ No website domain - skipping")
             return []
 
-        # Step 2: Find ALL emails at company (up to 10)
-        logger.info(f"  📧 Searching for emails at domain: {domain}")
-        logger.info(f"  📧 Company name for context: {company_name}")
+        # Step 2: Find ALL emails at company (up to 20)
+        logger.info(f"  📧 Finding emails at {domain}...")
         email_result = self.email_enricher.find_company_emails(domain, company_name)
 
-        raw_emails = email_result.get('emails', [])
-        logger.info(f"  ✓ Found {len(raw_emails)} raw emails from AnyMailFinder")
-
-        # FILTER: Only keep emails matching the company domain
-        emails = [e for e in raw_emails if self.validate_email_domain(e, domain)]
-        logger.info(f"  ✓ Filtered to {len(emails)} emails matching domain '{domain}'")
-
-        # Log filtered out emails for debugging
-        if len(raw_emails) > len(emails):
-            filtered_out = len(raw_emails) - len(emails)
-            logger.warning(f"  ⚠️ Removed {filtered_out} emails with wrong domains:")
-            for email in raw_emails:
-                if not self.validate_email_domain(email, domain):
-                    email_domain = email.split('@')[1] if '@' in email else 'unknown'
-                    logger.warning(f"     ✗ {email} (domain: {email_domain}, expected: {domain})")
+        emails = email_result.get('emails', [])
+        logger.info(f"  ✓ Found {len(emails)} emails")
 
         if not emails:
-            logger.info(f"  ⊘ No valid emails found matching domain - skipping")
+            logger.info(f"  ⊘ No emails found - skipping")
             return []
 
         # Step 3-5: Process each email (PARALLEL for 2-3x speed boost)
@@ -1024,17 +901,12 @@ class LeadEnricher:
                     result = future.result()
                     if result:
                         decision_makers.append(result)
-                        # LIMIT: Stop after finding 4 decision-makers
-                        if len(decision_makers) >= 4:
-                            logger.info(f"  ⚠️ Reached max limit (4 DMs), stopping search")
-                            break
                 except Exception as e:
                     email = futures[future]
                     logger.error(f"  ❌ Error processing {email}: {str(e)}")
 
         logger.info(f"✓ Found {len(decision_makers)} decision-makers for {company_name}")
-        # Ensure we return max 4 DMs
-        return decision_makers[:4]
+        return decision_makers
 
     def generate_personalization(self, company: str, dm_data: Dict, website_desc: str) -> str:
         """Generate personalized message using rotated prompts."""
@@ -1163,14 +1035,14 @@ class LeadEnricher:
             logger.error(f"Error generating message: {e}")
             return ""
 
-    def process_row(self, row: Dict, row_index: int, sheet_id: str, grid_id: int, headers: List[str], col_map: Dict, company: str, website: str, dry_run: bool = False) -> int:
+    def process_row(self, row: Dict, row_index: int, sheet_id: str, grid_id: int, headers: List[str], col_map: Dict, company: str, website: str, dry_run: bool = False):
         """
         Process a single row using email-first workflow.
-        Updates ALL decision-makers by duplicating rows for additional DMs.
-        Returns number of decision-makers processed (for row offset tracking).
+        Updates the FIRST decision-maker found back to the Google Sheet row.
+        Additional decision-makers are logged but not written.
         """
         if not company:
-            return 0
+            return []
 
         logger.info(f"\nProcessing row {row_index+1}: {company}")
 
@@ -1179,66 +1051,51 @@ class LeadEnricher:
 
         if not decision_makers:
             logger.warning(f"  ❌ No decision-makers found for {company}")
-            return 0
+            return []
 
-        logger.info(f"  ★ Found {len(decision_makers)} decision-makers")
-
-        # Update FIRST decision-maker in current row
+        # Use FIRST decision-maker for sheet update
         first_dm = decision_makers[0]
-        logger.info(f"  → DM 1/{len(decision_makers)}: {first_dm['full_name']} ({first_dm['job_title']})")
+        logger.info(f"  ★ Primary DM: {first_dm['full_name']} ({first_dm['job_title']})")
 
+        # Log additional decision-makers (not added to sheet)
+        if len(decision_makers) > 1:
+            logger.info(f"  ℹ️  Found {len(decision_makers) - 1} additional decision-makers (not added to sheet):")
+            for dm in decision_makers[1:]:
+                logger.info(f"     - {dm['full_name']} ({dm['job_title']}): {dm['email']}")
+
+        # Generate personalization for first DM
+        msg = ""
+        if self.openai_client:
+            dm_context = {
+                'full_name': first_dm['full_name'],
+                'title': first_dm['job_title'],
+                'linkedin': first_dm['linkedin_url'],
+                'description': f"{first_dm['job_title']} at {company}"
+            }
+            msg = self.generate_personalization(company, dm_context, website or "")
+
+        # Update sheet with first decision-maker data
         if not dry_run:
             updates = {
                 'First Name': first_dm['first_name'],
                 'Last Name': first_dm['last_name'],
                 'Email': first_dm['email'],
                 'LinkedIn URL': first_dm['linkedin_url'],
-                'Job Title': first_dm['job_title']
+                'Job Title': first_dm['job_title'],
+                'Personalized Message': msg
             }
+
             self.update_sheet_row(sheet_id, grid_id, row_index, updates, headers)
-            logger.info(f"  ✓ Updated row {row_index + 1}")
-
-        # If multiple DMs: duplicate rows and add them
-        if len(decision_makers) > 1:
-            additional_dms = decision_makers[1:]
-            logger.info(f"  → Duplicating {len(additional_dms)} additional rows...")
-
-            if not dry_run:
-                # Insert new blank rows below current row
-                self.insert_new_rows(sheet_id, grid_id, row_index, len(additional_dms))
-
-                # Copy original company data to new rows
-                new_row_indices = [row_index + i + 1 for i in range(len(additional_dms))]
-                self.duplicate_row_data(sheet_id, grid_id, new_row_indices, headers, row)
-
-                # Update each new row with its DM data
-                for i, dm in enumerate(additional_dms):
-                    target_row = row_index + i + 1
-                    logger.info(f"  → DM {i+2}/{len(decision_makers)}: {dm['full_name']} ({dm['job_title']})")
-
-                    updates = {
-                        'First Name': dm['first_name'],
-                        'Last Name': dm['last_name'],
-                        'Email': dm['email'],
-                        'LinkedIn URL': dm['linkedin_url'],
-                        'Job Title': dm['job_title']
-                    }
-                    self.update_sheet_row(sheet_id, grid_id, target_row, updates, headers)
-
-                logger.info(f"  ✓ Added {len(additional_dms)} new rows")
-            else:
-                for i, dm in enumerate(additional_dms):
-                    logger.info(f"  → DM {i+2}/{len(decision_makers)}: {dm['full_name']} ({dm['job_title']}) - {dm['email']}")
-                logger.info(f"  ⚠️  Dry run - would duplicate {len(additional_dms)} rows")
-
-        return len(decision_makers)
+            logger.info(f"  ✓ Updated sheet row {row_index + 1}")
+        else:
+            logger.info(f"  ⚠️  Dry run - would update: {first_dm['first_name']} {first_dm['last_name']} ({first_dm['email']})")
 
     def ensure_output_columns(self, sheet_id: str, grid_id: int, headers: List[str]) -> List[str]:
         """
         Ensure output columns exist in the sheet. Add them if missing.
         Returns updated headers list.
         """
-        required_cols = ['First Name', 'Last Name', 'Email', 'LinkedIn URL', 'Job Title']
+        required_cols = ['First Name', 'Last Name', 'Email', 'LinkedIn URL', 'Job Title', 'Personalized Message']
 
         missing_cols = [col for col in required_cols if col not in headers]
 
@@ -1283,13 +1140,13 @@ class LeadEnricher:
     def execute(self, sheet_id: str, limit: int = 10, dry_run: bool = False):
         """
         Main execution flow with email-first enrichment.
-        Reads Google Sheet → Enriches each company → Updates ALL decision-makers (duplicates rows).
+        Reads Google Sheet → Enriches each company → Updates sheet with FIRST decision-maker.
         """
-        print(f"🚀 Starting Lead Enrichment v2.2 (Email-First + Row Duplication)")
+        print(f"🚀 Starting Lead Enrichment v2.1 (Email-First)")
         print(f"   Limit: {limit} rows")
         print(f"   Dry Run: {dry_run}")
         print(f"   Expected Coverage: 200-300% (multiple DMs per company)")
-        print(f"   Output: Duplicates rows for each decision-maker found")
+        print(f"   Output: Updates Google Sheet with new columns (preserves existing data)")
 
         data, headers, grid_id = self.read_sheet(sheet_id)
         logger.info(f"Generated headers: {headers}")
@@ -1324,14 +1181,12 @@ class LeadEnricher:
         if not dry_run:
             print(f"\n🔧 Checking output columns...")
             headers = self.ensure_output_columns(sheet_id, grid_id, headers)
-            print(f"✓ Output columns ready: First Name, Last Name, Email, LinkedIn URL, Job Title")
+            print(f"✓ Output columns ready: First Name, Last Name, Email, LinkedIn URL, Job Title, Personalized Message")
 
         print(f"\n⏳ Processing {min(limit, len(data))} companies...\n")
 
         processed = 0
-        total_dms = 0
-        current_row_index = 1  # Start at row 2 (after header row, 0-indexed)
-        processed_companies = set()  # Track companies already processed (deduplication)
+        updated = 0
 
         for i, row in enumerate(data):
             if processed >= limit:
@@ -1340,47 +1195,23 @@ class LeadEnricher:
             company = row.get(company_col, '').strip()
             website = row.get(website_col, '').strip() if website_col else ""
 
-            # CRITICAL FIX: Log current state for debugging
-            logger.info(f"[Loop i={i}] current_row_index={current_row_index}, company='{company}'")
-
             if not company:
                 logger.info(f"Skipping row {i+2} (empty company)")
-                current_row_index += 1  # Still increment for empty rows
                 continue
 
-            # DEDUPLICATION: Skip if company already processed
-            company_key = company.lower()
-            if company_key in processed_companies:
-                logger.info(f"⚠️ SKIPPING DUPLICATE: Row {current_row_index+1} has '{company}' (already processed earlier)")
-                logger.info(f"   → This row will NOT be enriched (duplicate detection working correctly)")
-                current_row_index += 1  # Move to next row in sheet
-                continue
-
-            # Process row and get number of DMs added
-            logger.info(f"✓ PROCESSING: Row {current_row_index+1} - {company}")
-            num_dms = self.process_row(row, current_row_index, sheet_id, grid_id, headers, {}, company, website, dry_run)
-
-            if num_dms > 0:
-                processed += 1
-                total_dms += num_dms
-                logger.info(f"   → Found {num_dms} DMs, advancing current_row_index from {current_row_index} to {current_row_index + num_dms}")
-                current_row_index += num_dms  # Skip over duplicated rows (1 original + n-1 duplicates)
-                processed_companies.add(company_key)  # Mark as processed
-            else:
-                # No DMs found, just move to next row
-                logger.info(f"   → No DMs found, advancing current_row_index from {current_row_index} to {current_row_index + 1}")
-                current_row_index += 1
-                processed_companies.add(company_key)  # Still mark as processed (don't retry)
+            # Process row and update sheet with FIRST decision-maker
+            self.process_row(row, i + 1, sheet_id, grid_id, headers, {}, company, website, dry_run)
+            processed += 1
+            updated += 1
 
             # Progress update every 10%
             if processed % max(1, min(limit, len(data)) // 10) == 0:
                 progress = (processed / min(limit, len(data))) * 100
-                print(f"⏳ Progress: {processed}/{min(limit, len(data))} companies ({progress:.0f}%) | {total_dms} decision-makers found")
+                print(f"⏳ Progress: {processed}/{min(limit, len(data))} companies ({progress:.0f}%) | {updated} rows updated")
 
         print(f"\n✅ Enrichment complete!")
         print(f"   Companies processed: {processed}")
-        print(f"   Decision-makers found: {total_dms}")
-        print(f"   Coverage rate: {total_dms/processed*100:.0f}%" if processed > 0 else "   Coverage rate: 0%")
+        print(f"   Rows updated: {updated}")
         if not dry_run:
             print(f"   Google Sheet: https://docs.google.com/spreadsheets/d/{sheet_id}")
         else:

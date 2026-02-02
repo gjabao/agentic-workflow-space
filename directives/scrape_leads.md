@@ -28,7 +28,7 @@ Scrape B2B business leads using Apify's leads-finder actor with email verificati
 
 **Dependencies:**
 - Apify API (lead scraping)
-- SSMasters API (email verification)
+- AnyMailFinder API (email verification)
 - Azure OpenAI (icebreaker generation)
 - Google Sheets API (export)
 
@@ -294,3 +294,14 @@ python3 execution/scrape_apify_leads.py \
 
 ## Changelog
 - **2026-01-03**: Added 'Safety & Operational Policies' section (Cost thresholds, Credential protection, Secrets management, Changelog requirement).
+- **2026-01-29**: **BREAKING CHANGE** - Migrated to AnyMailFinder API for email verification.
+  - **Old API**: SSMasters bulk verification (CSV upload + polling)
+  - **New API**: AnyMailFinder email verification (individual POST requests)
+  - **Benefits**: More reliable, better deliverability checking, catch-all detection, simpler implementation
+  - **Migration**: Updated `SSMastersVerifier` → `AnyMailFinderVerifier` class
+  - **Config**: Using existing `ANYMAILFINDER_API_KEY` from .env
+  - **API Endpoint**: `https://api.anymailfinder.com/v5.1/verify-email`
+  - **Authentication**: API key in Authorization header
+  - **Pricing**: 0.2 credits per verification, repeated verifications within 30 days are free
+  - **Response**: Returns status (valid, invalid, catch-all, unknown) with detailed validation
+  - **Self-Annealing**: System now uses proven email verification service with better accuracy

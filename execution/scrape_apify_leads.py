@@ -149,110 +149,108 @@ def run_async(coro):
             return asyncio.run(coro)
 
 
-class SSMastersVerifier:
-    """Handles email verification using SSMasters API."""
-    
-    BASE_URL = "https://ssmasters.com/api/v1/public"
-    
+class AnyMailFinderVerifier:
+    """Handles email verification using AnyMailFinder API."""
+
+    BASE_URL = "https://api.anymailfinder.com/v5.1/verify-email"
+
     def __init__(self, api_key: str):
         self.api_key = api_key
-        
-    def verify_bulk(self, emails: List[str]) -> Dict[str, str]:
+
+    def verify_bulk(self, emails: List[str], leads: List[Dict] = None) -> Dict[str, str]:
         """
-        Verify a list of emails using bulk verification API.
-        
+        Verify a list of emails using AnyMailFinder API.
+
         Args:
             emails: List of email addresses to verify
-            
+            leads: Original lead data (not used for AnyMailFinder, kept for compatibility)
+
         Returns:
-            Dict mapping email -> status (Valid, Invalid, Catch-All, etc.)
+            Dict mapping email -> status (Valid, Invalid, Catch-All, Unknown)
         """
         if not emails:
             return {}
-            
-        logger.info(f"Verifying {len(emails)} emails with SSMasters...")
-        
-        # 1. Create CSV content
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(['email'])
-        for email in emails:
-            writer.writerow([email])
-        csv_content = output.getvalue()
-        
-        # 2. Upload for bulk verification
-        try:
-            files = {
-                'csvFile': ('emails.csv', csv_content, 'text/csv')
-            }
-            data = {'apiKey': self.api_key}
 
-            response = requests.post(
-                f"{self.BASE_URL}/verify/bulk",
-                files=files,
-                data=data,
-                timeout=REQUESTS_TIMEOUT
-            )
-            response.raise_for_status()
-            result = response.json()
-            
-            if not result.get('success'):
-                logger.error(f"Verification upload failed: {result.get('message')}")
-                return {}
-                
-            request_id = result['requestId']
-            logger.info(f"Verification queued. Request ID: {request_id}")
-            
-            # 3. Poll for results
-            return self._poll_results(request_id)
-            
-        except requests.Timeout:
-            logger.error(f"Email verification upload timed out after {REQUESTS_TIMEOUT}s")
-            return {}
-        except Exception as e:
-            sanitized_error = sanitize_error(str(e))
-            logger.error(f"Error during email verification: {sanitized_error}")
-            return {}
-            
-    def _poll_results(self, request_id: str) -> Dict[str, str]:
-        """Poll status endpoint until completion with adaptive intervals."""
-        for attempt in range(VERIFICATION_MAX_RETRIES):
-            # Adaptive polling: start fast (2s), then slow down to 3s
-            wait_time = 2 if attempt < VERIFICATION_FAST_POLL_COUNT else VERIFICATION_SLOW_POLL_INTERVAL
-            time.sleep(wait_time)
+        logger.info(f"Verifying {len(emails)} emails with AnyMailFinder...")
+
+        results = {}
+        headers = {
+            'Authorization': self.api_key,
+            'Content-Type': 'application/json'
+        }
+
+        # Process emails one by one (AnyMailFinder charges 0.2 credits per verification)
+        for i, email in enumerate(emails):
+            if not email or not email.strip():
+                continue
+
+            email = email.strip().lower()
 
             try:
-                response = requests.get(
-                    f"{self.BASE_URL}/request/{request_id}/status",
-                    params={'apiKey': self.api_key},
-                    timeout=10  # Shorter timeout for polling requests
+                payload = {'email': email}
+
+                response = requests.post(
+                    self.BASE_URL,
+                    headers=headers,
+                    json=payload,
+                    timeout=REQUESTS_TIMEOUT
                 )
-                response.raise_for_status()
-                data = response.json()
 
-                status = data['request']['status']
-                processed = data['request'].get('processedEmails', 0)
-                total = data['request'].get('totalEmails', 0)
+                if response.status_code == 200:
+                    data = response.json()
 
-                # Only log every 3rd attempt to reduce noise
-                if attempt % 3 == 0:
-                    logger.info(f"Verification status: {status} ({processed}/{total})")
+                    # Parse AnyMailFinder response
+                    # Actual format: {"email_status": "valid|invalid|catch-all|unknown", ...}
+                    status = data.get('email_status', 'unknown').lower()
 
-                if status == 'completed':
-                    results = {}
-                    for item in data['request']['results']:
-                        results[item['email']] = item['status']
-                    return results
+                    # Map to our standard statuses
+                    if status == 'valid':
+                        results[email] = 'Valid'
+                    elif status == 'invalid':
+                        results[email] = 'Invalid'
+                    elif status in ['catch-all', 'catch_all', 'catchall']:
+                        results[email] = 'Catch-All'
+                    else:
+                        results[email] = 'Unknown'
 
-                if status == 'failed':
-                    logger.error("Verification job failed.")
-                    return {}
+                    # Log individual results
+                    if results[email] == 'Valid':
+                        logger.debug(f"  ✓ {email}: Valid")
+                    elif results[email] == 'Invalid':
+                        logger.debug(f"  ✗ {email}: Invalid")
+                    else:
+                        logger.debug(f"  ? {email}: {results[email]}")
 
+                elif response.status_code == 401:
+                    logger.error("❌ AnyMailFinder authentication failed. Check API key.")
+                    results[email] = 'Unknown'
+                else:
+                    logger.warning(f"  ⚠️ Error {response.status_code} for {email}")
+                    results[email] = 'Unknown'
+
+                # Log progress every 10 emails
+                if (i + 1) % 10 == 0:
+                    valid_so_far = sum(1 for s in results.values() if s == 'Valid')
+                    logger.info(f"  Progress: {i + 1}/{len(emails)} ({valid_so_far} valid)")
+
+                # Small delay to respect rate limits
+                time.sleep(0.1)
+
+            except requests.Timeout:
+                logger.warning(f"  ⚠️ Timeout for {email}")
+                results[email] = 'Unknown'
             except Exception as e:
-                logger.warning(f"Error polling status: {e}")
+                sanitized_error = sanitize_error(str(e))
+                logger.warning(f"  ⚠️ Error verifying {email}: {sanitized_error}")
+                results[email] = 'Unknown'
 
-        logger.error("Verification timed out.")
-        return {}
+        valid_count = sum(1 for status in results.values() if status == 'Valid')
+        invalid_count = sum(1 for status in results.values() if status == 'Invalid')
+        catchall_count = sum(1 for status in results.values() if status == 'Catch-All')
+
+        logger.info(f"✓ Verification complete: {valid_count} valid, {invalid_count} invalid, {catchall_count} catch-all")
+
+        return results
 
 
 class ApifyLeadScraper:
@@ -275,22 +273,22 @@ class ApifyLeadScraper:
     def __init__(self):
         """Initialize the scraper with API credentials."""
         self.apify_token = os.getenv("APIFY_API_KEY")
-        self.ssmasters_token = os.getenv("SSMASTERS_API_KEY")
-        
+        self.anymailfinder_token = os.getenv("ANYMAILFINDER_API_KEY")
+
         if not self.apify_token:
             raise ValueError("APIFY_API_KEY not found in environment variables")
-            
+
         self.client = ApifyClient(self.apify_token)
-        self.verifier = SSMastersVerifier(self.ssmasters_token) if self.ssmasters_token else None
+        self.verifier = AnyMailFinderVerifier(self.anymailfinder_token) if self.anymailfinder_token else None
         # Initialize icebreaker generator with Azure OpenAI
         azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
         azure_key = os.getenv("AZURE_OPENAI_API_KEY")
         azure_deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
         self.icebreaker_gen = IcebreakerGenerator(azure_endpoint, azure_key, azure_deployment) if (azure_endpoint and azure_key) else None
-        
+
         if not self.verifier:
-            logger.warning("⚠️ SSMASTERS_API_KEY not found. Email verification will be skipped.")
-            
+            logger.warning("⚠️ ANYMAILFINDER_API_KEY not found. Email verification will be skipped.")
+
         if not self.icebreaker_gen:
             logger.warning("⚠️ Azure OpenAI credentials not found. Icebreaker generation will be skipped.")
         

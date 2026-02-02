@@ -8,7 +8,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>/Users/nguyengiabao/Downloads/Claude skill/Anti-Gravity Workspace/backup_workspace.sh</string>
+        <string>/Users/nguyengiabao/backup_antigravity.sh</string>
     </array>
 
     <key>StartCalendarInterval</key>
@@ -39,6 +39,6 @@
     <false/>
 
     <key>WorkingDirectory</key>
-    <string>/Users/nguyengiabao/Downloads/Claude skill/Anti-Gravity Workspace</string>
+    <string>/Users/nguyengiabao</string>
 </dict>
 </plist>

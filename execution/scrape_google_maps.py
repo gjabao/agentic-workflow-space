@@ -1685,101 +1685,111 @@ class GoogleMapsLeadScraper:
         max_results: int = 50,
         skip_email_enrichment: bool = False,
         skip_dm_enrichment: bool = False,
-        exclude_csv: str = None
+        exclude_csv: str = None,
+        skip_first: int = 0
     ) -> Dict:
         """Execute workflow following MD file steps."""
         start_time = time.time()
 
         print("\n" + "="*70)
-        print("🚀 GOOGLE MAPS LEAD SCRAPER v3.2 - ALL CONTACTS")
+        print("🚀 GOOGLE MAPS LEAD SCRAPER v3.3 - SKIP LOGIC")
         print(f"Searches: {search_queries}")
         print(f"Location: {location}")
         print(f"Target: {max_results} results per search")
+        if skip_first:
+            print(f"Skipping first {skip_first} results per search")
         if exclude_csv:
             print(f"📋 Excluding leads from: {exclude_csv}")
         print("="*70 + "\n")
 
-        try:
-            # Load existing domains to exclude
-            exclude_domains = set()
-            if exclude_csv:
-                exclude_domains = self.load_existing_domains(exclude_csv)
+        # Load exclusions
+        exclude_domains = set()
+        if exclude_csv:
+            exclude_domains = self.load_existing_domains(exclude_csv)
 
-            # Step 1: Scrape Google Maps
-            raw_data = self.scrape_google_maps(search_queries, location, max_results)
+        all_clean_data = []
 
-            if not raw_data:
-                return {'success': False, 'error': 'No results found'}
-
-            # Clean & Filter (with exclusion list)
-            cleaned_data = self.clean_data(raw_data, search_queries, exclude_domains)
-
-            if not cleaned_data:
-                return {'success': False, 'error': 'No valid data'}
-
-            # Step 2: Enrich emails
-            if not skip_email_enrichment:
-                enriched_data = self.enrich_emails(cleaned_data)
-            else:
-                enriched_data = cleaned_data
-
-            # Steps 3-6: Enrich decision makers
-            if not skip_dm_enrichment:
-                contacts = self.enrich_all_decision_makers(enriched_data)
-            else:
-                contacts = []
-
-            # Step 7: Export
-            sheet_title = f"Leads - {' '.join(search_queries)[:30]} - {location} - {datetime.now().strftime('%Y-%m-%d')}"
-            sheet_url = None
-            csv_file = None
-
+        for query in search_queries:
+            # 1. Scrape
             try:
-                sheet_url = self.export_to_google_sheets(contacts, sheet_title)
-            except Exception as sheet_error:
-                logger.warning(f"⚠️  Google Sheets export failed: {sheet_error}")
-                logger.info("📄 Falling back to CSV export...")
-                csv_file = self.export_to_csv(contacts, f"{location.replace(',', '_')}")
+                # Fetch EXTRA results if we need to skip some
+                limit_to_fetch = max_results + skip_first
+                raw_data = self.scrape_google_maps([query], location, max_results=limit_to_fetch)
+            except Exception as e:
+                logger.error(f"Failed to scrape '{query}': {e}")
+                continue
 
-            # Metrics
-            duration = time.time() - start_time
+            # SKIP LOGIC
+            if skip_first > 0:
+                if len(raw_data) > skip_first:
+                    logger.info(f"⏭️  Skipping top {skip_first} results...")
+                    raw_data = raw_data[skip_first:]
+                else:
+                    logger.warning(f"⚠️  Only found {len(raw_data)} results, skipping all (skip_first={skip_first})")
+                    raw_data = []
 
-            unique_companies = len(enriched_data)
-            total_contacts = len(contacts)
+            # 2. Clean & Filter
+            cleaned_data = self.clean_data(raw_data, [query], exclude_domains)
+            all_clean_data.extend(cleaned_data)
+            
+            # Add new domains to exclusion set (dedup within session)
+            for item in cleaned_data:
+                if item.get('domain'):
+                    exclude_domains.add(item['domain'])
 
-            print("\n" + "="*70)
-            print("✅ SUCCESS!")
-            print(f"📊 Companies: {unique_companies}")
-            print(f"👥 Total Contacts: {total_contacts}")
-            if sheet_url:
-                print(f"🔗 Google Sheet: {sheet_url}")
-            if csv_file:
-                print(f"📄 CSV File: {csv_file}")
-            print(f"⏱️  Duration: {duration:.1f}s")
-            print("="*70 + "\n")
+        # Deduplicate total list
+        unique_data = []
+        seen_domains = set()
+        for item in all_clean_data:
+            d = item.get('domain')
+            if d and d in seen_domains:
+                continue
+            if d:
+                seen_domains.add(d)
+            unique_data.append(item)
 
-            return {
-                'success': True,
-                'leads': enriched_data,
-                'contacts': contacts,
-                'metrics': {
-                    'unique_companies': unique_companies,
-                    'total_contacts': total_contacts,
-                    'duration_seconds': duration
-                },
-                'sheet_url': sheet_url,
-                'csv_file': csv_file
-            }
+        total_scraped = len(unique_data)
+        logger.info(f"\n✅ Total Valid Unique Leads: {total_scraped}")
 
-        except Exception as e:
-            duration = time.time() - start_time
-            logger.error(f"❌ Failed: {e}")
+        if total_scraped == 0:
+            logger.warning("No leads found. Exiting.")
+            return {"success": False, "error": "No leads found"}
 
-            return {
-                'success': False,
-                'error': str(e),
-                'duration_seconds': duration
-            }
+        # 3. Enrich Emails
+        if not skip_email_enrichment:
+            enriched_with_emails = self.enrich_emails(unique_data)
+        else:
+            enriched_with_emails = unique_data
+
+        # 4. Enrich Decision Makers
+        if not skip_dm_enrichment:
+            final_data = self.enrich_all_decision_makers(enriched_with_emails)
+        else:
+            final_data = enriched_with_emails
+
+        # 5. Export
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        safe_loc = location.replace(',', '_').replace(' ', '_')
+        
+        # CSV Export
+        csv_file = self.export_to_csv(final_data, f"{safe_loc}_{timestamp}")
+        
+        # Google Sheet Export
+        sheet_title = f"Leads - {location} - {timestamp}"
+        sheet_url = self.export_to_google_sheets(final_data, sheet_title)
+
+        # Notify
+        duration = time.time() - start_time
+        msg = f"See: {sheet_url}" if sheet_url else f"CSV: {csv_file}"
+        notify_success(f"Scraped {len(final_data)} leads in {location}\n{msg}")
+
+        return {
+            "success": True,
+            "count": len(final_data),
+            "csv": csv_file,
+            "sheet": sheet_url,
+            "duration": duration
+        }
 
 
 def main():
@@ -1788,6 +1798,7 @@ def main():
     parser.add_argument('--location', type=str, required=True, help='Location (e.g., "Calgary, Canada")')
     parser.add_argument('--searches', nargs='+', required=True, help='Search queries (e.g., "medical aesthetic clinic" "med spa")')
     parser.add_argument('--limit', type=int, default=50, help='Max results per search (default: 50)')
+    parser.add_argument('--skip_first', type=int, default=0, help='Skip the first N results (default: 0)')
     parser.add_argument('--exclude', type=str, default=None, help='CSV file with existing leads to exclude (avoids duplicates)')
 
     args = parser.parse_args()
@@ -1800,7 +1811,8 @@ def main():
         max_results=args.limit,
         skip_email_enrichment=False,
         skip_dm_enrichment=False,
-        exclude_csv=args.exclude
+        exclude_csv=args.exclude,
+        skip_first=args.skip_first
     )
 
     if not result['success']:

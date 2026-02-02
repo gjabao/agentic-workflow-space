@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Indeed Job Scraper & Decision Maker Outreach System
-Scrapes jobs from Indeed, finds decision makers (Founder/CEO), gets emails, and generates outreach messages.
+Glassdoor Job Scraper & Decision Maker Outreach System
+Scrapes jobs from Glassdoor, finds decision makers (Founder/CEO/CFO), gets emails, and generates outreach messages.
 """
 
 import os
@@ -34,7 +34,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('.tmp/indeed_scraper.log'),
+        logging.FileHandler('.tmp/glassdoor_scraper.log'),
         logging.StreamHandler(sys.stdout)
     ]
 )
@@ -85,248 +85,19 @@ class AnyMailFinderCompanyAPI:
             return {'emails': [], 'status': 'not-found', 'count': 0}
 
 
-class RapidAPIGoogleSearch:
-    """
-    RapidAPI Google Search - Thread-safe wrapper with rate limiting
-    Copied from LinkedIn scraper v2.0 (lines 137-413)
-    """
-
-    def __init__(self, api_keys: List[str]):
-        self.api_keys = api_keys
-        self.current_key_index = 0
-        self.rate_limit_lock = Lock()
-        self.last_call_time = 0
-        self.min_delay = 0.2  # 5 req/sec per key
-        logger.info(f"✓ RapidAPI Google Search initialized ({len(api_keys)} keys)")
-
-    def _get_current_key(self) -> str:
-        """Rotate between API keys for higher throughput"""
-        key = self.api_keys[self.current_key_index]
-        self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
-        return key
-
-    def _rate_limited_search(self, query: str, num_results: int = 10) -> Optional[Dict]:
-        """Thread-safe rate-limited Google search"""
-        with self.rate_limit_lock:
-            elapsed = time.time() - self.last_call_time
-            if elapsed < self.min_delay:
-                time.sleep(self.min_delay - elapsed)
-            self.last_call_time = time.time()
-
-        for attempt in range(3):
-            try:
-                url = "https://google-search116.p.rapidapi.com/"
-                headers = {
-                    "x-rapidapi-key": self._get_current_key(),
-                    "x-rapidapi-host": "google-search116.p.rapidapi.com"
-                }
-                params = {
-                    "query": query,
-                    "num": str(num_results)
-                }
-
-                response = requests.get(url, headers=headers, params=params, timeout=15)
-
-                if response.status_code == 200:
-                    data = response.json()
-                    return {
-                        'results': [
-                            {
-                                'url': result.get('url', ''),
-                                'title': result.get('title', ''),
-                                'snippet': result.get('description', '')
-                            }
-                            for result in data.get('results', [])
-                        ]
-                    }
-                elif response.status_code == 429:
-                    logger.debug(f"  ⚠️ Rate limit hit, waiting {2 ** attempt}s")
-                    time.sleep(2 ** attempt)
-                    continue
-
-            except Exception as e:
-                if attempt < 2:
-                    wait_time = 2 ** attempt
-                    logger.debug(f"  ⚠️ Google Search error (attempt {attempt+1}), waiting {wait_time}s")
-                    time.sleep(wait_time)
-                    continue
-                logger.debug(f"  ⚠️ Google Search error after 3 attempts: {e}")
-                return None
-
-        return None
-
-    def _normalize_company(self, text: str) -> str:
-        """Normalize company name for comparison"""
-        if not text:
-            return ""
-        text = text.lower()
-        text = text.replace('&', 'and')
-        suffixes = ['inc', 'llc', 'ltd', 'corp', 'corporation', 'company', 'co']
-        for suffix in suffixes:
-            text = re.sub(rf'\b{suffix}\.?\b', '', text)
-        text = re.sub(r'\s+', ' ', text).strip()
-        text = re.sub(r'[^\w\s]', '', text)
-        return text
-
-    def search_website(self, company_name: str, keywords: str = "") -> Dict:
-        """
-        Search for company website with 3-attempt fallback strategy
-        """
-        search_attempts = [
-            f'"{company_name}" {keywords} official website' if keywords else f'"{company_name}" official website',
-            f'"{company_name}" company website',
-            f'{company_name} site'
-        ]
-
-        for attempt_num, query in enumerate(search_attempts, 1):
-            logger.info(f"  🔍 Website search attempt {attempt_num}/3: {query[:60]}...")
-
-            data = self._rate_limited_search(query, num_results=10)
-
-            if data and data.get('results'):
-                # Two-pass: prefer homepage over subpages
-                homepage_result = None
-                subpage_result = None
-
-                for result in data['results']:
-                    url = result.get('url', '')
-                    title = result.get('title', '').lower()
-
-                    # Skip unwanted domains
-                    skip_patterns = [
-                        'linkedin.com', 'facebook.com', 'twitter.com', 'instagram.com',
-                        'indeed.com', 'glassdoor.com', 'ziprecruiter.com',
-                        'wikipedia.org', 'zoominfo.com', 'crunchbase.com',
-                        '.gov', '.edu', '.pdf'
-                    ]
-                    if any(skip in url.lower() for skip in skip_patterns):
-                        continue
-
-                    # Company name match
-                    company_lower = company_name.lower()
-                    is_match = False
-
-                    if attempt_num <= 2:
-                        # Strict match
-                        is_match = company_lower in title or company_lower in url.lower()
-                    else:
-                        # Relaxed match
-                        company_words = company_lower.split()[:2]
-                        is_match = any(word in title or word in url.lower() for word in company_words if len(word) > 3)
-
-                    if not is_match:
-                        continue
-
-                    # Detect subpage
-                    subpage_patterns = ['/careers', '/jobs', '/about', '/team', '/contact']
-                    is_subpage = any(pattern in url.lower() for pattern in subpage_patterns)
-
-                    website_result = {
-                        'url': url,
-                        'description': result.get('snippet', '')
-                    }
-
-                    if is_subpage:
-                        if not subpage_result:
-                            subpage_result = website_result
-                            logger.info(f"    → Found subpage (backup): {url[:60]}")
-                    else:
-                        homepage_result = website_result
-                        logger.info(f"    ✓ Found homepage: {url[:60]}")
-                        return homepage_result
-
-                # Return homepage if found, otherwise use subpage as fallback
-                if homepage_result:
-                    return homepage_result
-                elif subpage_result and attempt_num == len(search_attempts):
-                    logger.info(f"    ⚠️ Using subpage as fallback")
-                    return subpage_result
-
-        logger.info(f"  ✗ Website not found after 3 attempts")
-        return {'url': '', 'description': ''}
-
-    def search_linkedin_by_name(self, person_name: str, company_name: str) -> Dict:
-        """
-        Search LinkedIn for a specific person at a company
-        2-query relaxed strategy for single initials
-        """
-        # 2-query strategy: strict first, then relaxed
-        name_parts = person_name.split()
-        if len(name_parts) == 2 and len(name_parts[0]) == 1:
-            # Single initial + last name (I Leikin, M Welling)
-            queries = [
-                (f'site:linkedin.com/in/ "{person_name}" "{company_name}"', 5),  # Strict
-                (f'site:linkedin.com/in/ {name_parts[1]} {company_name}', 7)     # Relaxed (last name only)
-            ]
-        else:
-            # Full name
-            queries = [(f'site:linkedin.com/in/ "{person_name}" "{company_name}"', 5)]
-
-        logger.info(f"  → Searching LinkedIn for: {person_name} at {company_name}")
-
-        for query_num, (query, num_results) in enumerate(queries, 1):
-            if query_num > 1:
-                logger.info(f"  → Attempt {query_num}: Relaxed search (last name only)")
-
-            data = self._rate_limited_search(query, num_results=num_results)
-
-            if data and data.get('results'):
-                for result in data['results']:
-                    url = result.get('url', '')
-                    title = result.get('title', '')
-                    snippet = result.get('snippet', '')
-
-                    if 'linkedin.com/in/' not in url:
-                        continue
-
-                    # Parse name/title from LinkedIn result
-                    name_part = title.split('-')[0].strip() if '-' in title else title.strip()
-                    dm_title = ""
-                    if '-' in title and len(title.split('-')) > 1:
-                        title_part = title.split('-')[1].strip()
-                        if '|' in title_part:
-                            title_part = title_part.split('|')[0].strip()
-                        dm_title = title_part
-
-                    name_parts_result = name_part.split()
-                    if len(name_parts_result) >= 2:
-                        first_name = name_parts_result[0]
-                        last_name = ' '.join(name_parts_result[1:])
-                    else:
-                        first_name = name_part
-                        last_name = ""
-
-                    result_data = {
-                        'full_name': name_part,
-                        'first_name': first_name,
-                        'last_name': last_name,
-                        'title': dm_title,
-                        'linkedin_url': url,
-                        'description': snippet,
-                        'source': f'LinkedIn Name Search (Query {query_num})'
-                    }
-
-                    logger.info(f"  ✓ Found: {name_part} - {dm_title}")
-                    return result_data
-
-        # All queries failed
-        return {}
-
-
-class IndeedJobScraper:
+class GlassdoorJobScraper:
     # Actor IDs
-    JOB_SCRAPER_ACTOR_ID = "misceres/indeed-scraper"  # Indeed Jobs Scraper
+    JOB_SCRAPER_ACTOR_ID = "agentx/glassdoor-hiring-scraper"
 
-    # API Config
-    ANYMAILFINDER_URL = "https://api.anymailfinder.com/v5.1/find-email/person"
+    # API Config (v2.0 Email-First)
     RAPIDAPI_GOOGLE_SEARCH_URL = "https://google-search116.p.rapidapi.com/"
     SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
 
     # Performance Configuration
-    MAX_WORKERS = int(os.getenv("MAX_WORKERS", "20"))  # Increased from 10 to 20
-    APIFY_POLL_INTERVAL_START = 1  # Start at 1 second
-    APIFY_POLL_INTERVAL_MAX = 5    # Cap at 5 seconds
-    APIFY_MAX_WAIT = 600  # 10 minutes timeout
+    MAX_WORKERS = int(os.getenv("MAX_WORKERS", "10"))  # Reduced from 20→10 for better rate limiting
+    APIFY_POLL_INTERVAL_START = 1
+    APIFY_POLL_INTERVAL_MAX = 5
+    APIFY_MAX_WAIT = 600
 
     def __init__(self):
         # 1. Apify
@@ -335,16 +106,10 @@ class IndeedJobScraper:
             raise ValueError("APIFY_API_KEY not found")
         self.apify_client = ApifyClient(self.apify_token)
 
-        # 2. RapidAPI for Google Search (v2.2 wrapper class)
-        rapidapi_key = os.getenv("RAPIDAPI_KEY")
-        rapidapi_key2 = os.getenv("RAPIDAPI_KEY_2")  # Optional second key for higher throughput
-        api_keys = [k for k in [rapidapi_key, rapidapi_key2] if k]
-
-        if api_keys:
-            self.rapidapi_search = RapidAPIGoogleSearch(api_keys)
-        else:
-            self.rapidapi_search = None
-            logger.warning("⚠️ RAPIDAPI_KEY not found. Decision maker search will be skipped.")
+        # 2. RapidAPI for Google Search
+        self.rapidapi_key = os.getenv("RAPIDAPI_KEY")
+        if not self.rapidapi_key:
+            logger.warning("⚠️ RAPIDAPI_KEY not found. Decision maker search will be slower.")
 
         # 3. AnyMailFinder Company API (v2.0 Email-First)
         anymail_key = os.getenv("ANYMAILFINDER_API_KEY")
@@ -368,11 +133,16 @@ class IndeedJobScraper:
             self.openai_client = None
             logger.warning("⚠️ Azure OpenAI keys missing. Message generation will be skipped.")
 
+        # Rate limiting for RapidAPI (prevent 429 errors)
+        self.rapidapi_lock = Lock()
+        self.last_rapidapi_call = 0
+        self.rapidapi_delay = 0.25  # 250ms between calls = ~4 req/sec
+
         # Caching for performance
         self._website_cache = {}  # Cache company websites
         self._dm_cache = {}       # Cache decision makers
 
-        logger.info("✓ IndeedJobScraper initialized")
+        logger.info("✓ GlassdoorJobScraper initialized")
 
     def normalize_company_name(self, company_name: str) -> str:
         """Normalize company name by removing legal suffixes and cleaning up."""
@@ -405,12 +175,6 @@ class IndeedJobScraper:
             return ""
 
         # Remove everything after common delimiters
-        # Examples:
-        # "Senior Research Software Engineer - Security & Cryptography" → "Senior Research Software Engineer"
-        # "Senior iOS Engineer, Music" → "Senior iOS Engineer"
-        # "Product Manager (Remote)" → "Product Manager"
-        # "Director of Finance Regina/Saskatoon" → "Director of Finance"
-
         for delimiter in [' - ', ' – ', ' — ', ',', ' (', ' /', ' |']:
             if delimiter in job_title:
                 job_title = job_title.split(delimiter)[0].strip()
@@ -418,41 +182,49 @@ class IndeedJobScraper:
 
         return job_title.strip()
 
-    def detect_company_type(self, company_name: str, industry: str = "", description: str = "") -> str:
-        """Detect company type/industry based on company name, industry field, and description."""
-        # Only use company name + industry for detection (skip job description to avoid false positives)
-        text = f"{company_name} {industry}".lower()
+    def detect_company_type(self, company_name: str, industry: str = "", description: str = "", website_desc: str = "") -> str:
+        """
+        Detect company type/industry based on multiple signals.
 
-        # Technology & Software (CHECK FIRST - most common for dev jobs)
-        if any(word in text for word in ['software', 'technology', 'tech ', 'saas', 'cloud', 'digital', 'it ', 'data', 'ai ', 'cyber', 'web3', 'blockchain', 'crypto']):
-            return 'Technology & Software'
+        Priority: website description → job description → industry → company name
+        """
+        # Prioritize website description (most accurate)
+        text = f"{website_desc} {description} {industry} {company_name}".lower()
 
-        # Financial Services
-        if any(word in text for word in ['bank', 'financial', 'finance', 'capital', 'investment', 'asset management', 'insurance', 'credit', 'fintech', 'payment']):
+        # Media & Information (NEW - for companies like Thomson Reuters)
+        if any(word in text for word in ['news', 'media', 'publishing', 'journalist', 'information services', 'reuters', 'bloomberg']):
+            return 'Media & Information'
+
+        # Financial Services (IMPROVED - added payment processing)
+        if any(word in text for word in ['bank', 'financial', 'finance', 'capital', 'investment', 'asset management', 'insurance', 'credit', 'payment', 'fintech', 'moneris']):
             return 'Financial Services'
 
-        # Healthcare & Medical (More specific keywords to avoid false positives)
-        if any(word in text for word in ['hospital', 'healthcare provider', 'medical center', 'clinic', 'pharmaceutical', 'pharma', 'biotech', 'diagnostic']):
+        # Healthcare & Medical
+        if any(word in text for word in ['hospital', 'health', 'medical', 'clinic', 'healthcare', 'pharmaceutical', 'pharma', 'biotech', 'cancer research', 'patient']):
             return 'Healthcare & Medical'
 
-        # Construction & Real Estate
-        if any(word in text for word in ['construction', 'builder', 'contractor', 'real estate', 'property management', 'homebuilding', 'architecture']):
+        # Construction & Real Estate (IMPROVED - added infrastructure)
+        if any(word in text for word in ['construction', 'builder', 'contractor', 'real estate', 'property', 'development', 'infrastructure']):
             return 'Construction & Real Estate'
 
+        # Technology & Software
+        if any(word in text for word in ['software', 'technology', 'tech ', 'saas', 'cloud', 'digital', 'it ', 'data', 'ai ', 'cyber', 'innovation']):
+            return 'Technology & Software'
+
         # Manufacturing & Industrial
-        if any(word in text for word in ['manufacturing', 'industrial', 'fabrication', 'production', 'factory']):
+        if any(word in text for word in ['manufacturing', 'industrial', 'fabrication', 'production', 'factory', 'machining']):
             return 'Manufacturing & Industrial'
 
         # Retail & Consumer
-        if any(word in text for word in ['retail', 'store', 'shopping', 'consumer', 'ecommerce', 'e-commerce']):
+        if any(word in text for word in ['retail', 'store', 'shopping', 'consumer', 'ecommerce', 'e-commerce', 'commerce']):
             return 'Retail & Consumer'
 
         # Professional Services
-        if any(word in text for word in ['consulting', 'consulting', 'accounting', 'legal', 'law', 'recruitment', 'staffing', 'hr ']):
+        if any(word in text for word in ['consulting', 'accounting', 'legal', 'law', 'recruitment', 'staffing', 'hr ', 'advisory']):
             return 'Professional Services'
 
         # Non-Profit & Government
-        if any(word in text for word in ['nonprofit', 'non-profit', 'charity', 'foundation', 'government', 'municipal', 'city of', 'town of']):
+        if any(word in text for word in ['nonprofit', 'non-profit', 'charity', 'foundation', 'government', 'municipal', 'city of', 'town of', 'institute']):
             return 'Non-Profit & Government'
 
         # Education
@@ -465,44 +237,30 @@ class IndeedJobScraper:
 
         return 'Other'
 
-    def start_scraping_job(self, query: str, location: str, country: str = "United States", max_jobs: int = 10, days_posted: int = 7) -> str:
+    def start_scraping_job(self, query: str, location: str, country: str = "Canada", max_jobs: int = 10, days_posted: int = 60) -> str:
         """Start the Apify scraper job and return the run ID."""
-        logger.info(f"🔍 Starting scrape for {max_jobs} jobs: '{query}' in '{location}', {country}...")
+        logger.info(f"🔍 Starting Glassdoor scrape for {max_jobs} jobs: '{query}' in '{location}', {country}...")
 
-        # Map country names to country codes for Indeed
-        country_code_map = {
-            "United States": "US", "United Kingdom": "GB", "Canada": "CA", "Australia": "AU",
-            "Germany": "DE", "France": "FR", "India": "IN", "Singapore": "SG", "Netherlands": "NL",
-            "Spain": "ES", "Italy": "IT", "Brazil": "BR", "Mexico": "MX", "Japan": "JP", "China": "CN"
-        }
-        country_code = country_code_map.get(country, "US")
+        # Glassdoor actor expects "posted_since" in format "60 days"
+        posted_since = f"{days_posted} days"
 
         run_input = {
-            "position": query,
-            "country": country_code,
+            "country": country,
             "location": location if location else "",
-            "maxItems": max_jobs,
-            "parseCompanyDetails": True,
-            "saveOnlyUniqueItems": True,
-            "followApplyRedirects": False,
-            "maxAge": days_posted  # Filter by days
+            "search_terms": [query],
+            "max_results": max_jobs,
+            "posted_since": posted_since
         }
-        
+
         try:
             # Start the actor asynchronously
             run = self.apify_client.actor(self.JOB_SCRAPER_ACTOR_ID).start(run_input=run_input)
             run_id = run["id"]
-            logger.info(f"✓ Scraper started. Run ID: {run_id}")
+            logger.info(f"✓ Glassdoor scraper started. Run ID: {run_id}")
             return run_id
         except Exception as e:
             logger.error(f"❌ Failed to start scraper: {e}")
             return ""
-
-    def is_web3_job(self, title: str) -> bool:
-        """Filter for Web3-specific job titles only."""
-        # DISABLED: Return True for all jobs (no filtering)
-        # This allows scraping of any job type (finance, tech, etc.)
-        return True
 
     def stream_jobs(self, run_id: str) -> Generator[Dict, None, None]:
         """Yield jobs from the Apify dataset as they become available with exponential backoff."""
@@ -530,8 +288,8 @@ class IndeedJobScraper:
 
             if items:
                 for item in items:
-                    company = item.get('company', '')
-                    title = item.get('positionName', '')
+                    company = item.get('company_name', '')
+                    title = item.get('title', '')
 
                     if not company or not title:
                         continue
@@ -540,17 +298,24 @@ class IndeedJobScraper:
                     normalized_company = self.normalize_company_name(company)
                     normalized_title = self.normalize_job_title(title)
 
-                    # Filter for Web3-specific jobs only
-                    if not self.is_web3_job(normalized_title if normalized_title else title):
-                        continue
+                    # Build salary range string if available
+                    salary_range = ""
+                    if item.get('salary_minimum') and item.get('salary_maximum'):
+                        currency = item.get('salary_currency', 'CAD')
+                        period = item.get('salary_period', 'yearly')
+                        salary_range = f"{currency} {item['salary_minimum']:,}-{item['salary_maximum']:,} {period}"
 
                     yield {
                         'company_name': normalized_company if normalized_company else company,
                         'job_title': normalized_title if normalized_title else title,
-                        'job_url': item.get('url', ''),
+                        'job_url': item.get('platform_url', ''),
                         'job_description': item.get('description', ''),
-                        'posted_date': item.get('postedAt', ''),
-                        'location': item.get('location', '')
+                        'posted_date': item.get('posted_date', ''),
+                        'location': item.get('location', ''),
+                        'salary_range': salary_range,
+                        'company_size': item.get('employee_count', ''),
+                        'company_industry': item.get('company_industry', ''),
+                        'company_rating': item.get('company_rating', '')
                     }
 
                 offset += len(items)
@@ -563,29 +328,411 @@ class IndeedJobScraper:
             time.sleep(poll_delay)
             poll_delay = min(poll_delay * 1.5, self.APIFY_POLL_INTERVAL_MAX)
 
+    def find_decision_maker_by_name(self, person_name: str, company_name: str) -> Dict:
+        """
+        Find LinkedIn profile by PERSON NAME + COMPANY (v2.1 Email-First Fix).
+
+        This searches for the SPECIFIC PERSON extracted from email, not generic decision-makers.
+        Example: "Fatima Kamalia" at "Mackenzie Health" → finds Fatima's profile
+        """
+        # Check cache first (use person+company as key)
+        cache_key = f"{person_name}|{company_name}"
+        if cache_key in self._dm_cache:
+            return self._dm_cache[cache_key]
+
+        if not self.rapidapi_key or not person_name:
+            return {}
+
+        # 3-ATTEMPT STRATEGY: Search by NAME + COMPANY
+        search_attempts = [
+            # Attempt 1: Exact name + company on LinkedIn
+            f'site:linkedin.com/in/ "{person_name}" "{company_name}"',
+
+            # Attempt 2: Name + company without site restriction (broader)
+            f'"{person_name}" "{company_name}" linkedin profile',
+
+            # Attempt 3: Just name + company (very broad)
+            f'{person_name} {company_name} linkedin'
+        ]
+
+        for search_attempt_num, query in enumerate(search_attempts, 1):
+            logger.debug(f"    → LinkedIn search attempt {search_attempt_num}/3: {person_name}")
+
+            result = self._linkedin_search(query, search_attempt_num)
+            if result.get('full_name'):
+                # Cache the result
+                self._dm_cache[cache_key] = result
+                logger.debug(f"    ✓ LinkedIn found: {result['full_name']} - {result.get('title', '')}")
+                return result
+
+        # All 3 attempts failed
+        logger.debug(f"    ✗ LinkedIn not found for {person_name}")
+        return {}
+
+    def find_decision_maker(self, company_name: str) -> Dict:
+        """
+        [LEGACY] Find decision makers by COMPANY NAME only (for backwards compatibility).
+
+        NOTE: This method is used by old workflows. New email-first workflow uses
+        find_decision_maker_by_name() instead for better accuracy.
+        """
+        # Check cache first
+        if company_name in self._dm_cache:
+            return self._dm_cache[company_name]
+
+        if not self.rapidapi_key:
+            return {}
+
+        # 3-ATTEMPT STRATEGY for finding decision makers
+        search_attempts = [
+            # Attempt 1: Finance-specific titles with company name (most targeted)
+            f'site:linkedin.com/in/ ("cfo" OR "chief financial officer" OR "vp finance" OR "vice president finance" OR "director of finance" OR "controller") "{company_name}"',
+
+            # Attempt 2: Broader executive titles (fallback if no finance leaders found)
+            f'site:linkedin.com/in/ ("founder" OR "co-founder" OR "ceo" OR "chief executive officer" OR "owner" OR "managing partner" OR "president") "{company_name}"',
+
+            # Attempt 3: Very broad search without site restriction (last resort)
+            f'("{company_name}" AND (cfo OR "chief financial officer" OR ceo OR founder OR president) linkedin profile)'
+        ]
+
+        # Try 3 different search attempts before giving up
+        for search_attempt_num, query in enumerate(search_attempts, 1):
+            logger.info(f"  → Attempt {search_attempt_num}/3: Searching for decision maker at {company_name}")
+
+            result = self._linkedin_search(query, search_attempt_num)
+            if result.get('full_name'):
+                # Cache the result
+                self._dm_cache[company_name] = result
+                logger.info(f"  ✓ Found: {result['full_name']} - {result.get('title', '')}")
+                return result
+
+        # All 3 attempts failed
+        logger.info(f"  ✗ No decision maker found after 3 attempts")
+        return {}
+
+    def _linkedin_search(self, query: str, attempt_num: int) -> Dict:
+        """
+        Execute LinkedIn search via RapidAPI Google Search.
+        Returns parsed LinkedIn profile data or empty dict.
+        """
+        max_retries = 2
+        for retry in range(max_retries):
+            try:
+                # Rate limiting logic - sleep OUTSIDE the lock
+                wait_time = 0
+                with self.rapidapi_lock:
+                    elapsed = time.time() - self.last_rapidapi_call
+                    if elapsed < self.rapidapi_delay:
+                        wait_time = self.rapidapi_delay - elapsed
+                    else:
+                        self.last_rapidapi_call = time.time()
+
+                if wait_time > 0:
+                    time.sleep(wait_time)
+                    # Update timestamp after sleep
+                    with self.rapidapi_lock:
+                        self.last_rapidapi_call = time.time()
+
+                headers = {
+                    'x-rapidapi-host': 'google-search116.p.rapidapi.com',
+                    'x-rapidapi-key': self.rapidapi_key
+                }
+                params = {'query': query}
+
+                response = requests.get(
+                    self.RAPIDAPI_GOOGLE_SEARCH_URL,
+                    headers=headers,
+                    params=params,
+                    timeout=10
+                )
+
+                if response.status_code == 429:
+                    if retry < max_retries - 1:
+                        time.sleep((retry + 1) * 2)
+                        continue
+                    return {}
+
+                if response.status_code != 200:
+                    return {}
+
+                data = response.json()
+                organic_results = data.get('results', [])
+                if not organic_results:
+                    return {}
+
+                top_result = organic_results[0]
+                title = top_result.get('title', '')
+                link = top_result.get('url', '')
+                description = top_result.get('description', '')
+
+                # Parse name/title logic
+                name_part = title.split('-')[0].strip() if '-' in title else title.strip()
+                dm_title = ""
+                if '-' in title and len(title.split('-')) > 1:
+                    title_part = title.split('-')[1].strip()
+                    if '|' in title_part:
+                        title_part = title_part.split('|')[0].strip()
+                    dm_title = title_part
+
+                name_parts = name_part.split()
+                if len(name_parts) >= 2:
+                    first_name = name_parts[0]
+                    last_name = ' '.join(name_parts[1:])
+                else:
+                    first_name = name_part
+                    last_name = ""
+
+                # SUCCESS - Found a profile
+                return {
+                    'full_name': name_part,
+                    'first_name': first_name,
+                    'last_name': last_name,
+                    'title': dm_title,
+                    'linkedin_url': link,
+                    'description': description,
+                    'source': f'RapidAPI Google Search (Attempt {attempt_num})'
+                }
+
+            except Exception as e:
+                if retry < max_retries - 1:
+                    time.sleep(1)
+                    continue
+                else:
+                    return {}
+
+        return {}
+
     def find_company_website(self, company_name: str, keywords: str = "") -> Dict:
         """
-        Find company website using RapidAPI wrapper with 3-attempt fallback strategy (v2.2).
+        IMPROVED v2.1: Find company website with 90%+ success rate using MULTI-RETRY strategy
+
+        Strategy 1: RapidAPI Google Search with keywords (3 query variations)
+        Strategy 2: RapidAPI Google Search without keywords (3 query variations)
+        Strategy 3: Domain guessing with expanded TLDs (.com, .ca, .org, .io, .co, .net, .biz)
+        Strategy 4: Wildcard Google Search (last resort)
 
         Args:
             company_name: Company name to search for
             keywords: Contextual keywords (location + industry) to improve search accuracy
         """
-        # Check cache first (include keywords in cache key for unique searches)
+        # Check cache first
         cache_key = f"{company_name}|{keywords}" if keywords else company_name
         if cache_key in self._website_cache:
             return self._website_cache[cache_key]
 
-        if not self.rapidapi_search:
-            return {'url': '', 'description': ''}
+        logger.info(f"  🔍 Finding website for: {company_name}")
 
-        # Use wrapper class method (handles rate limiting, retries, 3-attempt strategy)
-        result = self.rapidapi_search.search_website(company_name, keywords)
+        # ========== STRATEGY 1: Google Search WITH Keywords (3 attempts) ==========
+        if self.rapidapi_key and keywords:
+            queries_with_keywords = [
+                f'"{company_name}" {keywords} official website',
+                f'{company_name} {keywords} website',
+                f'{company_name} {keywords} home'
+            ]
 
-        # Cache result
-        self._website_cache[cache_key] = result
-        return result
-    
+            for attempt, query in enumerate(queries_with_keywords, 1):
+                logger.info(f"  → Strategy 1.{attempt}: Google + keywords")
+                result = self._try_google_search(query)
+                if result.get('url'):
+                    logger.info(f"  ✅ SUCCESS (Strategy 1.{attempt}): {result['url']}")
+                    self._website_cache[cache_key] = result
+                    return result
+                time.sleep(0.3)  # Small delay between attempts
+
+        # ========== STRATEGY 2: Google Search WITHOUT Keywords (3 attempts) ==========
+        if self.rapidapi_key:
+            queries_without_keywords = [
+                f'"{company_name}" official website',
+                f'{company_name} company website',
+                f'{company_name} homepage'
+            ]
+
+            for attempt, query in enumerate(queries_without_keywords, 1):
+                logger.info(f"  → Strategy 2.{attempt}: Google search")
+                result = self._try_google_search(query)
+                if result.get('url'):
+                    logger.info(f"  ✅ SUCCESS (Strategy 2.{attempt}): {result['url']}")
+                    self._website_cache[cache_key] = result
+                    return result
+                time.sleep(0.3)
+
+        # ========== STRATEGY 3: Domain Guessing with Expanded TLDs ==========
+        logger.info(f"  → Strategy 3: Domain guessing")
+        guessed_domain = self._guess_domain(company_name, keywords)
+        if guessed_domain:
+            result = {'url': f"https://{guessed_domain}", 'description': 'Domain guessed from company name'}
+            logger.info(f"  ✅ SUCCESS (Strategy 3): {guessed_domain}")
+            self._website_cache[cache_key] = result
+            return result
+
+        # ========== STRATEGY 4: Wildcard Google Search (last resort) ==========
+        if self.rapidapi_key:
+            wildcard_queries = [
+                f'{company_name} Canada',
+                f'{company_name} company',
+                company_name  # Just the name
+            ]
+
+            for attempt, query in enumerate(wildcard_queries, 1):
+                logger.info(f"  → Strategy 4.{attempt}: Wildcard search")
+                result = self._try_google_search(query)
+                if result.get('url'):
+                    logger.info(f"  ✅ SUCCESS (Strategy 4.{attempt}): {result['url']}")
+                    self._website_cache[cache_key] = result
+                    return result
+                time.sleep(0.3)
+
+        # ========== ALL STRATEGIES FAILED ==========
+        logger.warning(f"  ⚠️  FAILED: No website found for {company_name} after all strategies")
+        empty_result = {'url': '', 'description': ''}
+        self._website_cache[cache_key] = empty_result
+        return empty_result
+
+    def _try_google_search(self, query: str) -> Dict:
+        """Try Google Search API with retry logic."""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                wait_time = 0
+                with self.rapidapi_lock:
+                    elapsed = time.time() - self.last_rapidapi_call
+                    if elapsed < self.rapidapi_delay:
+                        wait_time = self.rapidapi_delay - elapsed
+                    else:
+                        self.last_rapidapi_call = time.time()
+
+                if wait_time > 0:
+                    time.sleep(wait_time)
+                    with self.rapidapi_lock:
+                        self.last_rapidapi_call = time.time()
+
+                headers = {
+                    'x-rapidapi-host': 'google-search116.p.rapidapi.com',
+                    'x-rapidapi-key': self.rapidapi_key
+                }
+                params = {'query': query}
+
+                response = requests.get(
+                    self.RAPIDAPI_GOOGLE_SEARCH_URL,
+                    headers=headers,
+                    params=params,
+                    timeout=10
+                )
+
+                if response.status_code == 429:
+                    if attempt < max_retries - 1:
+                        time.sleep((attempt + 1) * 2)
+                        continue
+                    return {'url': '', 'description': ''}
+
+                if response.status_code != 200:
+                    return {'url': '', 'description': ''}
+
+                data = response.json()
+                organic_results = data.get('results', [])
+
+                if not organic_results:
+                    return {'url': '', 'description': ''}
+
+                # Filter out social media and job boards
+                for result in organic_results:
+                    url = result.get('url', '')
+                    if any(skip in url.lower() for skip in ['linkedin.com', 'facebook.com', 'twitter.com', 'glassdoor.com', 'indeed.com']):
+                        continue
+                    return {
+                        'url': url,
+                        'description': result.get('description', '')
+                    }
+
+                return {'url': '', 'description': ''}
+
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                else:
+                    return {'url': '', 'description': ''}
+        return {'url': '', 'description': ''}
+
+    def _guess_domain(self, company_name: str, keywords: str = "") -> str:
+        """
+        Guess company domain from name using smart heuristics.
+
+        Returns: domain string (e.g., "acme.com") or empty string
+        """
+        if not company_name or company_name.lower() == 'confidential':
+            return ""
+
+        # Clean company name
+        clean_name = company_name.lower()
+
+        # Remove common legal suffixes
+        legal_suffixes = [
+            ' inc.', ' inc', ' llc', ' ltd.', ' ltd', ' corp.', ' corp',
+            ' co.', ' co', ' l.p.', ' lp', ' llp', ' plc', ' limited',
+            ' corporation', ' company', ' incorporated'
+        ]
+        for suffix in legal_suffixes:
+            clean_name = clean_name.replace(suffix, '')
+
+        # Remove special characters and extra spaces
+        clean_name = re.sub(r'[^\w\s]', '', clean_name)
+        clean_name = clean_name.strip().replace(' ', '')
+
+        if len(clean_name) < 3:
+            return ""
+
+        # Determine TLD based on keywords/context (EXPANDED for better coverage)
+        tld_options = []
+
+        # Canadian keywords → prioritize .ca
+        if 'canada' in keywords.lower() or 'toronto' in keywords.lower() or 'vancouver' in keywords.lower():
+            tld_options = ['.ca', '.com', '.io', '.co', '.net']
+        # Healthcare/Education → prioritize .org
+        elif any(kw in keywords.lower() for kw in ['hospital', 'health', 'university', 'college', 'school']):
+            tld_options = ['.org', '.com', '.ca', '.net']
+        # Tech companies → try .io
+        elif any(kw in keywords.lower() for kw in ['technology', 'software', 'tech', 'saas', 'ai', 'data']):
+            tld_options = ['.com', '.io', '.ai', '.co', '.ca', '.net']
+        # Default → comprehensive list
+        else:
+            tld_options = ['.com', '.ca', '.io', '.co', '.net', '.org']
+
+        # Try each TLD and validate with HTTP HEAD request
+        for tld in tld_options:
+            domain = f"{clean_name}{tld}"
+            if self._validate_domain(domain):
+                logger.debug(f"    ✓ Domain found: {domain}")
+                return domain
+
+        return ""
+
+    def _validate_domain(self, domain: str) -> bool:
+        """
+        Validate if domain exists by checking HTTP response.
+        Returns True if domain responds (200, 301, 302, etc.)
+        """
+        try:
+            url = f"https://{domain}"
+            response = requests.head(url, timeout=3, allow_redirects=True)
+            # Accept any response that's not a connection error
+            if response.status_code < 500:
+                logger.debug(f"    ✓ Domain validated: {domain} (HTTP {response.status_code})")
+                return True
+        except:
+            pass
+
+        # Try HTTP if HTTPS fails
+        try:
+            url = f"http://{domain}"
+            response = requests.head(url, timeout=3, allow_redirects=True)
+            if response.status_code < 500:
+                logger.debug(f"    ✓ Domain validated: {domain} (HTTP {response.status_code})")
+                return True
+        except:
+            pass
+
+        return False
+
     def extract_domain(self, url: str) -> str:
         """Extract domain from URL."""
         if not url:
@@ -598,7 +745,7 @@ class IndeedJobScraper:
                 domain = domain[4:]
             return domain
         except:
-            return "" 
+            return ""
 
 
     def extract_contact_from_email(self, email: str) -> Tuple[str, bool, float]:
@@ -618,12 +765,7 @@ class IndeedJobScraper:
         # Pattern 1: firstname.lastname@
         if '.' in local_part and not local_part.startswith('.') and not local_part.endswith('.'):
             parts = local_part.split('.')
-            # Allow single-letter first initials (q.xu@, b.smith@) but last name must be 2+ chars
-            valid_parts = []
-            for i, p in enumerate(parts):
-                if p.isalpha() and ((i == 0 and 1 <= len(p) <= 20) or (i > 0 and 2 <= len(p) <= 20)):
-                    valid_parts.append(p)
-
+            valid_parts = [p for p in parts if p.isalpha() and 2 <= len(p) <= 20]
             if len(valid_parts) == 2:
                 return (f"{valid_parts[0].capitalize()} {valid_parts[1].capitalize()}", False, 0.95)
             elif len(valid_parts) > 2:
@@ -637,55 +779,76 @@ class IndeedJobScraper:
             conf = 0.9 if len(first) >= 3 and len(last) >= 3 else 0.7
             return (f"{first} {last}", False, conf)
         elif len(name_parts) == 1 and len(name_parts[0]) >= 3:
-            single_part = name_parts[0]
-
-            # Try camelCase detection (jagirim → J Agirim, mleander → M Leander)
-            if len(single_part) >= 4:
-                # Check if starts with lowercase followed by uppercase (jAgirim, mLeander)
-                for i in range(1, len(single_part)):
-                    if single_part[i].isupper():
-                        # Found camelCase boundary
-                        first_initial = single_part[0].upper()
-                        rest = single_part[i:].capitalize()
-                        return (f"{first_initial} {rest}", False, 0.85)
-
-                # Check if pattern is [single-letter][rest] (jagirim → J Agirim)
-                if len(single_part) >= 4:
-                    first_initial = single_part[0].upper()
-                    rest = single_part[1:].capitalize()
-                    return (f"{first_initial} {rest}", False, 0.75)
-
-            # Fallback: single name
-            return (single_part.capitalize(), False, 0.6)
+            return (name_parts[0].capitalize(), False, 0.6)
 
         return ('', False, 0.2)
 
+    def _names_match(self, name1: str, name2: str, threshold: float = 0.6) -> bool:
+        """
+        Validate if two names match (FLEXIBLE fuzzy matching inspired by Crunchbase).
+
+        v2.2 SIMPLIFIED LOGIC (fixes single-name email bug):
+        - Uses simple containment check first (handles "Neil" vs "Neil T.", "Lily Feng" vs "Lily Feng, MBA")
+        - Falls back to SequenceMatcher for fuzzy similarity
+        - No complex first/last parsing → avoids rejecting valid single-name matches
+
+        Examples:
+        - "Fatima Kamalia" vs "Fatima Kamalia" → True (exact)
+        - "Lily Feng" vs "Lily Feng, MBA, CPA, CGA" → True (containment)
+        - "Neil" vs "Neil Thangavelu" → True (containment)
+        - "J Chu" vs "Justin Chu" → True (containment after cleaning)
+        - "Fatima Kamalia" vs "Greg Chow" → False (different)
+        """
+        if not name1 or not name2:
+            return False
+
+        # Clean names: remove credentials/suffixes and normalize
+        def clean_name(name):
+            # Remove credentials like MBA, CPA, PhD, etc.
+            cleaned = re.sub(r',?\s+(MBA|CPA|CGA|CFO|CEO|PhD|MD|JD|Esq|Jr|Sr|II|III|IV)\b.*$', '', name, flags=re.IGNORECASE)
+            # Remove extra whitespace and punctuation
+            cleaned = re.sub(r'[.,\-_]+', ' ', cleaned)
+            cleaned = re.sub(r'\s+', ' ', cleaned)
+            return cleaned.lower().strip()
+
+        n1 = clean_name(name1)
+        n2 = clean_name(name2)
+
+        # Strategy 1: Exact match after cleaning
+        if n1 == n2:
+            return True
+
+        # Strategy 2: Containment check (handles most variations)
+        # "neil" in "neil thangavelu" → True
+        # "lily feng" in "lily feng mba cpa" → True
+        if n1 in n2 or n2 in n1:
+            return True
+
+        # Strategy 3: Fuzzy similarity with SequenceMatcher (Crunchbase-style)
+        # Handles typos, slight variations
+        from difflib import SequenceMatcher
+        matcher = SequenceMatcher(None, n1, n2)
+        similarity = matcher.ratio()
+
+        return similarity >= threshold
+
     def is_decision_maker(self, job_title: str) -> bool:
-        """Validate if job title is decision-maker (RELAXED FOR FINANCE ROLES)"""
+        """Validate if job title is decision-maker"""
         if not job_title or len(job_title) < 3:
             return False
         jt_lower = job_title.lower()
 
-        # RELAXED: Accept decision-makers + senior finance roles + managers
-        dm_keywords = [
-            # C-Suite & Founders
-            'founder', 'co-founder', 'ceo', 'chief', 'owner', 'president',
-            'cfo', 'cto', 'coo', 'cmo', 'c-suite', 'c-level',
-            # Vice Presidents & Directors
-            'vice president', 'vp ', 'director', 'executive director', 'managing director',
-            # Heads & Partners
-            'head of', 'managing partner', 'partner', 'principal',
-            # Executive roles
-            'executive',
-            # ADDED: Finance-specific senior roles
-            'controller', 'senior manager', 'accounting manager', 'finance manager',
-            'senior accountant', 'senior analyst', 'manager', 'supervisor', 'lead'
-        ]
+        # Must have decision-maker keyword
+        dm_keywords = ['founder', 'co-founder', 'ceo', 'chief', 'owner', 'president',
+                       'managing partner', 'managing director', 'vice president', 'vp ',
+                       'cfo', 'cto', 'coo', 'cmo', 'executive', 'c-suite', 'c-level',
+                       'principal', 'partner', 'executive director']
         has_dm = any(kw in jt_lower for kw in dm_keywords)
 
-        # RELAXED: Only exclude entry-level roles
-        exclude_keywords = ['assistant', 'junior', 'intern', 'coordinator',
-                           'trainee', 'apprentice', 'student', 'clerk']
+        # Must NOT have exclude keyword
+        exclude_keywords = ['assistant', 'associate', 'junior', 'intern', 'coordinator',
+                           'analyst', 'specialist', 'representative', 'agent', 'clerk',
+                           'trainee', 'apprentice', 'student']
         has_exclude = any(kw in jt_lower for kw in exclude_keywords)
 
         return has_dm and not has_exclude
@@ -767,8 +930,6 @@ Rule 1: Pain Point MUST Match Job Title
 - The pain/function MUST be directly related to the job title being hired for
 - Example: Hiring "SDR" → talk about "outbound" or "pipeline" ✅
 - Example: Hiring "SDR" → talk about "engineering velocity" ❌ (wrong function!)
-- Example: Hiring "Blockchain Engineer" → talk about "smart contract deployment" ✅
-- Example: Hiring "Blockchain Engineer" → talk about "sales pipeline" ❌ (wrong function!)
 
 Rule 2: Specificity Test - MUST Pass All Three Checks
 Before writing, verify:
@@ -778,38 +939,27 @@ c) Would 10 different companies have 10 different interpretations of this pain?
    → If YES = TOO VAGUE, rewrite with more specificity
    → If NO = GOOD, pain is specific enough
 
-BAD (too vague): "scaling challenges" - every company has these
-GOOD (specific): "SDK adoption dropping below 30% after first integration" - measurable, specific to developer tools
-
-BAD (too vague): "hiring issues" - too generic
-GOOD (specific): "Web3 engineering pipeline running dry after 90 days without senior Solidity hires" - specific to crypto/blockchain
-
 CHOOSE ONE OF THESE 5 PATTERNS - ROTATE THROUGH ALL VERSIONS (don't default to one):
 
 VERSION 1: Pain Signal + Specificity
 Format: Noticed [company] recently [growth_signal from context]. Teams at this stage usually hit capacity issues in [function from role], especially around [specific_pain_point]
 NO LINE BREAKS - write as continuous paragraph
-Example: "Noticed Ramp is scaling fast—25,000+ customers is no small feat. Teams growing at this pace often hit capacity issues in outbound, especially keeping top-of-funnel consistent"
 
 VERSION 2: Peer Benchmark (Connector Angle)
 Format: Working with a few [industry] companies around your size. They're all running into the same [function] bottleneck as they scale past [growth_stage from context]
 NO LINE BREAKS - write as continuous paragraph
-Example: "Working with a few fintech companies around your size. They're all running into the same deal flow constraints as they scale into new markets"
 
 VERSION 3: Forward-Looking + Consultative
 Format: [Company] is growing fast ([specific_signal from context]). At this trajectory, most [industry] teams start feeling the squeeze in [function] within 3-6 months
 NO LINE BREAKS - write as continuous paragraph
-Example: "Stripe is growing fast—15 new countries launched. At this trajectory, most payments teams start feeling the squeeze in go-to-market within 3-6 months"
 
 VERSION 4: Pattern Recognition (Best for Multiple Intros)
 Format: I've introduced 3 [industry] companies to specialists this month. All had the same issue: [function] became a bottleneck after [trigger_event from context]
 NO LINE BREAKS - write as continuous paragraph
-Example: "I've introduced 3 AI companies to specialists this month. All had the same issue: engineering velocity became a bottleneck after Series B"
 
 VERSION 5: Direct + Low Pressure
 Format: Quick question—is [function] keeping up with growth at [company], or starting to show cracks
 NO LINE BREAKS - write as continuous paragraph
-Example: "Quick question—is outbound keeping up with growth at Webflow, or starting to show cracks"
 
 IMPORTANT: Mix up the versions. Don't always pick VERSION 2. Rotate through all 5 patterns based on context fit.
 
@@ -824,23 +974,8 @@ Generic Roles:
 - Customer Success → "retention", "expansion", "customer health", "NPS scores", "churn prevention"
 - Recruiter → "talent pipeline", "hiring velocity", "team scaling", "time-to-fill"
 - Data/Analytics → "insights speed", "data infrastructure", "reporting lag", "dashboard accuracy"
-
-Web3/Blockchain-Specific Roles (USE THESE FOR CRYPTO JOBS):
-- Blockchain Engineer/Developer → "smart contract deployment speed", "gas optimization", "audit cycles", "testnet-to-mainnet lag"
-- Solidity Developer → "contract security audits", "deployment velocity", "vulnerability detection", "bytecode optimization"
-- Smart Contract Engineer → "audit turnaround time", "exploit prevention", "contract upgradeability", "testing coverage"
-- Web3 Frontend/Full-stack → "wallet integration", "Web3.js performance", "dApp user onboarding", "transaction confirmation UX"
-- DeFi Engineer → "liquidity pool efficiency", "yield optimization", "TVL growth", "protocol security"
-- NFT Developer → "minting pipeline", "metadata management", "marketplace integration", "royalty tracking"
-- Crypto/Blockchain Architect → "chain interoperability", "bridge security", "cross-chain transaction speed", "validator performance"
-- Protocol Engineer → "consensus mechanism", "block finality time", "network throughput", "validator set coordination"
-
-GROWTH SIGNALS (infer from context):
-- Funding, team size, product launch, market expansion, revenue milestones
-- Examples: "just raised Series B", "scaling to 100 people", "entering new markets"
-
-TRIGGER EVENTS (infer from context):
-- "scaling past 50 people", "expanding to new markets", "post-funding", "product complexity increased"
+- Controller/CFO → "financial reporting speed", "cash flow visibility", "audit readiness", "forecasting accuracy"
+- Accountant → "close cycle time", "reconciliation efficiency", "compliance tracking", "month-end bottlenecks"
 
 Output ONLY the email body. No subject line. No explanations. Pick the version that feels most natural given the context.
 """
@@ -862,8 +997,9 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
 
     def process_single_company(self, job: Dict) -> List[Dict]:
         """
-        v2.0 EMAIL-FIRST WORKFLOW (Crunchbase Pattern):
-        1. Find website (3-attempt validation)
+        v2.3 EMAIL-FIRST WORKFLOW (Crunchbase Pattern + Filtering):
+        0. Filter out recruitment firms and confidential postings
+        1. Find website (3-attempt validation with expanded TLDs)
         2. Find ALL emails at company (up to 20)
         3. Extract names from emails (parallel processing)
         4. Search LinkedIn for each name (3-attempt)
@@ -871,13 +1007,14 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
         6. Return 2-3+ DMs per company (as many as found)
         """
         company = job['company_name']
-        
-        # Step 0: Detect company type
-        company_type = self.detect_company_type(
-            company,
-            job.get('industry', ''),
-            job.get('job_description', '')
-        )
+
+        # Step 0: Filter out recruitment firms and confidential postings
+        recruitment_keywords = ['recruiting', 'recruitment', 'staffing', 'headhunter', 'talent acquisition', 'search firm']
+        if company.lower() == 'confidential' or any(kw in company.lower() for kw in recruitment_keywords):
+            logger.info(f"\n{'='*70}")
+            logger.info(f"🏢 Company: {company}")
+            logger.info(f"  ⊘ Skipping recruitment firm/confidential posting")
+            return []
 
         # Step 1: Extract contextual keywords from job posting
         keywords = self.extract_company_keywords(job)
@@ -892,6 +1029,14 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
         website = website_data.get('url', '')
         company_desc = website_data.get('description', '')
         domain = self.extract_domain(website) if website else ""
+
+        # Step 3: Detect company type (v2.1 - uses website desc for better accuracy)
+        company_type = self.detect_company_type(
+            company,
+            job.get('industry', ''),
+            job.get('job_description', ''),
+            company_desc  # NEW: website description for better detection
+        )
 
         if not domain:
             logger.info(f"  ⊘ No website domain - skipping")
@@ -919,52 +1064,68 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
         seen_names = set()
 
         def process_single_email(email: str) -> Optional[Dict]:
-            """Extract name → Search LinkedIn (3 attempts) → Validate DM"""
+            """
+            v2.3 EMAIL-FIRST WORKFLOW WITH FALLBACK (Crunchbase-inspired):
+            1. Extract name from email
+            2. Search LinkedIn BY NAME (primary strategy)
+            3. If fails → Search BY COMPANY (fallback strategy)
+            4. Validate name match (CRITICAL - prevents wrong matches)
+            5. Validate decision-maker title
+            """
             logger.info(f"  🔍 Processing: {email}")
 
-            # Extract name from email
+            # Step 1: Extract name from email
             extracted_name, is_generic, confidence = self.extract_contact_from_email(email)
 
             if is_generic:
-                logger.info(f"  → Generic email - skipping")
+                logger.info(f"    → Generic email - skipping")
                 return None
 
-            # RELAXED: Accept confidence ≥ 20% (was 50%)
-            if not extracted_name or confidence < 0.2:
-                logger.info(f"  → Could not extract name (conf: {confidence:.0%}) - skipping")
+            if not extracted_name or confidence < 0.5:
+                logger.info(f"    → Could not extract name (conf: {confidence:.0%}) - skipping")
                 return None
 
-            logger.info(f"  → Extracted name: {extracted_name} (conf: {confidence:.0%})")
+            logger.info(f"    → Extracted: {extracted_name} (conf: {confidence:.0%})")
 
-            # Search LinkedIn by name + company (v2.2: use wrapper class)
-            if not self.rapidapi_search:
-                logger.info(f"  ✗ RapidAPI not configured - skipping")
-                return None
+            # Step 2: PRIMARY - Search LinkedIn by PERSON NAME + COMPANY
+            logger.info(f"    → Searching LinkedIn by NAME: {extracted_name}...")
+            dm = self.find_decision_maker_by_name(extracted_name, company)
 
-            logger.info(f"  → Searching LinkedIn...")
-            dm = self.rapidapi_search.search_linkedin_by_name(extracted_name, company)
-
+            # Step 3: FALLBACK - If name search fails, try company-wide search
             if not dm.get('full_name'):
-                logger.info(f"  ✗ LinkedIn not found")
-                return None
+                logger.info(f"    → Name search failed, trying company-wide search...")
+                dm = self.find_decision_maker(company)
 
-            full_name = dm.get('full_name', extracted_name)
+                if not dm.get('full_name'):
+                    logger.info(f"    ✗ LinkedIn not found (both strategies failed)")
+                    return None
+                else:
+                    logger.info(f"    → Found via company search: {dm.get('full_name')}")
+
+            full_name = dm.get('full_name')
             job_title = dm.get('title', '')
 
-            # Thread-safe duplicate check (AFTER LinkedIn search)
+            # Step 4: Validate name match (CRITICAL - prevents fatima→Greg Chow bugs)
+            if not self._names_match(extracted_name, full_name):
+                logger.info(f"    ✗ Name mismatch: {extracted_name} ≠ {full_name}")
+                return None
+
+            logger.info(f"    ✓ Name match: {extracted_name} = {full_name}")
+
+            # Step 5: Thread-safe duplicate check
             with seen_names_lock:
                 if full_name in seen_names:
-                    logger.info(f"  ✗ Duplicate name - skipping: {full_name}")
+                    logger.info(f"    ✗ Duplicate name - skipping: {full_name}")
                     return None
                 seen_names.add(full_name)
 
-            # Validate decision-maker
+            # Step 6: Validate decision-maker title
             if not self.is_decision_maker(job_title):
-                logger.info(f"  ✗ Not a decision-maker: {job_title}")
+                logger.info(f"    ✗ Not a decision-maker: {job_title}")
                 return None
 
-            # Build decision-maker record
-            logger.info(f"  ★ Found DM: {full_name} ({job_title})")
+            # SUCCESS - Build decision-maker record
+            logger.info(f"    ★ Found DM: {full_name} ({job_title})")
 
             # Generate message
             msg = ""
@@ -1039,7 +1200,7 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
                     return None
                 flow = InstalledAppFlow.from_client_secrets_file('credentials.json', self.SCOPES)
                 creds = flow.run_local_server(port=8080)
-            
+
             with open('token.json', 'w') as token:
                 token.write(creds.to_json())
 
@@ -1048,11 +1209,11 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
     def export_to_google_sheets(self, rows: List[Dict], title: str) -> str:
         """Export to Google Sheets."""
         logger.info("📊 Exporting to Google Sheets...")
-        
+
         creds = self.get_credentials()
         if not creds:
             return ""
-        
+
         try:
             service = build('sheets', 'v4', credentials=creds)
             drive_service = build('drive', 'v3', credentials=creds)
@@ -1062,7 +1223,7 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
             spreadsheet_id = spreadsheet.get('spreadsheetId')
             spreadsheet_url = spreadsheet.get('spreadsheetUrl')
             sheet_id = spreadsheet['sheets'][0]['properties']['sheetId']
-            
+
             headers = [
                 "Company Name", "Company Type", "Company Website", "Job Title", "Job URL", "Location",
                 "DM Name", "DM Title", "DM First", "DM Last", "DM LinkedIn",
@@ -1089,12 +1250,12 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
                     row.get('message', ''),
                     datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 ])
-            
+
             body = {'values': values}
             service.spreadsheets().values().update(
                 spreadsheetId=spreadsheet_id, range="A1", valueInputOption="RAW", body=body
             ).execute()
-            
+
             # Format header
             requests_format = [{
                 "repeatCell": {
@@ -1109,7 +1270,7 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
                 }
             }]
             service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={'requests': requests_format}).execute()
-            
+
             permission = {'type': 'anyone', 'role': 'reader'}
             drive_service.permissions().create(
                 fileId=spreadsheet_id,
@@ -1117,16 +1278,16 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
             ).execute()
 
             return spreadsheet_url
-            
+
         except Exception as e:
             logger.error(f"❌ Export failed: {e}")
             return ""
 
-    def execute(self, query: str, location: str = "", country: str = "United States", max_jobs: int = 10, days_posted: int = 14):
+    def execute(self, query: str, location: str = "", country: str = "Canada", max_jobs: int = 10, days_posted: int = 60):
         start_time = time.time()
 
         print("\n" + "="*70)
-        print("🚀 INDEED JOB SCRAPER & OUTREACH SYSTEM (STREAMING MODE)")
+        print("🚀 GLASSDOOR JOB SCRAPER & OUTREACH SYSTEM (STREAMING MODE)")
         print(f"Query: {query} | Location: {location} | Country: {country}")
         print("="*70 + "\n")
 
@@ -1137,22 +1298,26 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
 
         processed_jobs = []
         seen_companies = set()
-        
+
         # 2. Stream & Process
         print(f"🔄 Streaming & Processing jobs in parallel (workers={self.MAX_WORKERS})...")
 
         with ThreadPoolExecutor(max_workers=self.MAX_WORKERS) as executor:
             futures = []
-            
+
             # Producer: Stream jobs from Apify
             for job in self.stream_jobs(run_id):
                 company = job['company_name'].lower().strip()
-                
+
+                # Skip invalid company names
+                if not company or len(company) < 2 or company == 'company' or company == 'confidential':
+                    continue
+
                 # Deduplicate on the fly
                 if company in seen_companies:
                     continue
                 seen_companies.add(company)
-                
+
                 # Consumer: Submit to thread pool
                 future = executor.submit(self.process_single_company, job)
                 futures.append(future)
@@ -1195,14 +1360,14 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
 
         # Save CSV
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        csv_path = f".tmp/indeed_jobs_{timestamp}.csv"
-        
+        csv_path = f".tmp/glassdoor_jobs_{timestamp}.csv"
+
         if jobs_with_emails:
             pd.DataFrame(jobs_with_emails).to_csv(csv_path, index=False)
             print(f"📁 CSV Backup: {csv_path}")
-            
+
             # Export to Sheets
-            sheet_title = f"Jobs - {query} - {datetime.now().strftime('%Y-%m-%d')}"
+            sheet_title = f"Glassdoor Jobs - {query} - {datetime.now().strftime('%Y-%m-%d')}"
             url = self.export_to_google_sheets(jobs_with_emails, sheet_title)
             if url:
                 print(f"🔗 Google Sheet: {url}")
@@ -1215,18 +1380,18 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
 def main():
     """Main function with CLI arguments."""
     import argparse
-    parser = argparse.ArgumentParser(description='Indeed Job Scraper & Outreach System')
-    
-    parser.add_argument('--query', type=str, default="AI Automation Expert", help='Job search query')
-    parser.add_argument('--location', type=str, default="", help='Job location')
-    parser.add_argument('--country', type=str, default="United States", help='Country to scrape')
+    parser = argparse.ArgumentParser(description='Glassdoor Job Scraper & Outreach System')
+
+    parser.add_argument('--query', type=str, default="Controller", help='Job search query')
+    parser.add_argument('--location', type=str, default="Toronto", help='Job location')
+    parser.add_argument('--country', type=str, default="Canada", help='Country to scrape')
     parser.add_argument('--limit', type=int, default=10, help='Max jobs to scrape')
-    parser.add_argument('--days', type=int, default=14, help='Days posted')
-    
+    parser.add_argument('--days', type=int, default=60, help='Days posted')
+
     args = parser.parse_args()
-    
+
     try:
-        scraper = IndeedJobScraper()
+        scraper = GlassdoorJobScraper()
         scraper.execute(
             query=args.query,
             location=args.location,

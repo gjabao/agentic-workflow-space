@@ -39,49 +39,80 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# ONBOARDING SUBTASKS (5-10 key tasks)
+# ONBOARDING SUBTASKS - Value-First Nurture Sequence (14-Day Workflow)
 # =============================================================================
 
 ONBOARDING_SUBTASKS = [
+    # PHASE 0B: AI QUALIFICATION (After Form Submission)
     {
-        "name": "📋 ICP Research & Apollo URLs",
-        "description": "Extract target audiences from client profile, generate Apollo search URLs",
+        "name": "🔍 Phase 0B: AI Qualification",
+        "description": "Run: python3 execution/qualify_prospect_async.py --form-data .tmp/form_submission_{client}.json | Analyze form data, score 0-10, determine DECLINE/LIGHT_NURTURE/FULL_NURTURE",
+        "priority": 1
+    },
+
+    # PHASE 1: DEEP RESEARCH (Day 0-1)
+    {
+        "name": "🔬 Phase 1: Deep Company Research",
+        "description": "Run: python3 execution/research_prospect_company.py --company '{client}' --website '{website}' | Scrape website, analyze competitors, identify pain points & opportunities",
+        "priority": 1
+    },
+
+    # PHASE 2: VALUE-FIRST NURTURE SEQUENCE (Day 1-14)
+    {
+        "name": "📄 Touch 1 (Day 1): Industry Resource PDF",
+        "description": "Run: python3 execution/orchestrate_nurture_sequence.py --company '{client}' --touch 1 | Create & send branded PDF with immediate value | Channels: LinkedIn DM, Email | NO PITCH",
         "priority": 2
     },
     {
-        "name": "🎯 Scrape Leads (Audience 1)",
-        "description": "Run lead scraper for primary audience, verify emails, generate icebreakers",
+        "name": "🎥 Touch 2 (Day 3): Custom Loom Video",
+        "description": "Run: python3 execution/orchestrate_nurture_sequence.py --company '{client}' --touch 2 | Record 3-5min custom business breakdown | Channels: WhatsApp, Email | NO PITCH",
         "priority": 2
     },
     {
-        "name": "🎯 Scrape Leads (Audience 2)",
-        "description": "Run lead scraper for secondary audience if applicable",
+        "name": "📊 Touch 3 (Day 5): Notion Workspace",
+        "description": "Run: python3 execution/orchestrate_nurture_sequence.py --company '{client}' --touch 3 | Share interactive workspace with competitor insights | Channels: Email | NO PITCH",
+        "priority": 2
+    },
+    {
+        "name": "📈 Touch 4 (Day 7): Industry Report",
+        "description": "Run: python3 execution/orchestrate_nurture_sequence.py --company '{client}' --touch 4 | Send personalized competitor analysis | Channels: Email | NO PITCH",
+        "priority": 2
+    },
+    {
+        "name": "💬 Touch 5 (Day 10): LinkedIn Engagement",
+        "description": "Run: python3 execution/orchestrate_nurture_sequence.py --company '{client}' --touch 5 | Engage with their content authentically | Channels: LinkedIn | NO PITCH",
         "priority": 3
     },
     {
-        "name": "📧 Generate Cold Email Copy",
-        "description": "Analyze website, research competitors, generate 3+ email variants with Connector Angle",
+        "name": "✅ Touch 6 (Day 12): Check-In",
+        "description": "Run: python3 execution/orchestrate_nurture_sequence.py --company '{client}' --touch 6 | Ask if resources helped, no call ask yet | Channels: WhatsApp | NO PITCH",
         "priority": 2
     },
     {
-        "name": "✅ Quality Check: ≥50 Valid Emails",
-        "description": "Ensure at least 50 valid emails before proceeding to campaign",
+        "name": "📞 Touch 7 (Day 14): SOFT Call Invitation",
+        "description": "Run: python3 execution/orchestrate_nurture_sequence.py --company '{client}' --touch 7 | Soft invitation framed as help, not sales | Channels: WhatsApp, Email | SOFT ASK ALLOWED",
+        "priority": 1
+    },
+
+    # PHASE 3: ENGAGEMENT ASSESSMENT (Day 14-16)
+    {
+        "name": "📊 Phase 3: Engagement Assessment",
+        "description": "Evaluate engagement across 7 touches | HIGH: 3+ replies, questions, YES to call → Schedule | MEDIUM: Some engagement → One more touch | LOW: No engagement → STOP",
+        "priority": 1
+    },
+
+    # PHASE 4: DISCOVERY CALL (Only if HIGH engagement)
+    {
+        "name": "☎️ Phase 4: Schedule Discovery Call",
+        "description": "Only if HIGH engagement | Send calendar link | Prepare discovery call outline | Focus: Learn their world, not pitch",
+        "priority": 1
+    },
+
+    # PHASE 5: PROPOSAL & CLOSE (Post-Discovery)
+    {
+        "name": "📋 Phase 5: Custom Proposal",
+        "description": "After discovery call | Create tailored proposal | Present solution | Close deal or nurture further",
         "priority": 2
-    },
-    {
-        "name": "🚀 Setup Instantly Campaign",
-        "description": "Import leads, create campaign, set up follow-up sequence",
-        "priority": 1
-    },
-    {
-        "name": "📤 Launch Campaign",
-        "description": "Test deliverability, launch campaign, notify client",
-        "priority": 1
-    },
-    {
-        "name": "📊 Monitor & Report (48h check)",
-        "description": "Check opens/replies after 48h, handle positive responses",
-        "priority": 3
     }
 ]
 
@@ -146,16 +177,27 @@ class ClickUpClientOnboarder:
 
 ---
 
+### Workflow: Value-First Nurture (14 Days)
+
+**Philosophy:** Give MASSIVE value for 14 days BEFORE asking for call
+- 7 touches over 14 days (NO pitch until Day 14)
+- Engagement-based qualification (if no engagement → STOP)
+- Multi-call acceptance (2-3 calls for high-ticket deals)
+- Energy protection: Only proceed with engaged prospects
+
+---
+
 ### Notes
 {notes if notes else 'No additional notes.'}
 
 ---
 
 ### Deliverables
-- ICP Research: `.tmp/icp_research_{client_name.lower().replace(' ', '_')}.md`
-- Leads CSV: `.tmp/leads_*.csv`
-- Cold Email Copy: `.tmp/custom_copy_{client_name.lower().replace(' ', '_')}.md`
-- Campaign Summary: `.tmp/{client_name.lower().replace(' ', '_')}_campaign_summary.md`
+- Qualification Report: `.tmp/qualification_{client_name.lower().replace(' ', '_')}.md`
+- Deep Research: `.tmp/research_{client_name.lower().replace(' ', '_')}.md`
+- Nurture Plan: `.tmp/nurture_plan_{client_name.lower().replace(' ', '_')}.md`
+- Nurture Touches: `.tmp/nurture_touches_{client_name.lower().replace(' ', '_')}/touch_*.json`
+- Engagement Log: `.tmp/nurture_log_{client_name.lower().replace(' ', '_')}.md`
 """
 
             parent_task = self.client.create_task(
