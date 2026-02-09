@@ -1692,8 +1692,8 @@ class GoogleMapsLeadScraper:
         start_time = time.time()
 
         print("\n" + "="*70)
-        print("🚀 GOOGLE MAPS LEAD SCRAPER v3.3 - SKIP LOGIC")
-        print(f"Searches: {search_queries}")
+        print("🚀 GOOGLE MAPS LEAD SCRAPER v7.1 - BATCH MODE")
+        print(f"Searches: {len(search_queries)} keywords")
         print(f"Location: {location}")
         print(f"Target: {max_results} results per search")
         if skip_first:
@@ -1707,35 +1707,26 @@ class GoogleMapsLeadScraper:
         if exclude_csv:
             exclude_domains = self.load_existing_domains(exclude_csv)
 
-        all_clean_data = []
+        # 1. BATCH SCRAPE - All keywords in ONE Apify call
+        try:
+            limit_to_fetch = max_results + skip_first
+            logger.info(f"🔍 Scraping ALL {len(search_queries)} keywords in 1 batch...")
+            raw_data = self.scrape_google_maps(search_queries, location, max_results=limit_to_fetch)
+        except Exception as e:
+            logger.error(f"Failed to scrape: {e}")
+            return {"success": False, "error": str(e)}
 
-        for query in search_queries:
-            # 1. Scrape
-            try:
-                # Fetch EXTRA results if we need to skip some
-                limit_to_fetch = max_results + skip_first
-                raw_data = self.scrape_google_maps([query], location, max_results=limit_to_fetch)
-            except Exception as e:
-                logger.error(f"Failed to scrape '{query}': {e}")
-                continue
+        # SKIP LOGIC (applies to total results)
+        if skip_first > 0:
+            if len(raw_data) > skip_first:
+                logger.info(f"⏭️  Skipping top {skip_first} results...")
+                raw_data = raw_data[skip_first:]
+            else:
+                logger.warning(f"⚠️  Only found {len(raw_data)} results, skipping all (skip_first={skip_first})")
+                raw_data = []
 
-            # SKIP LOGIC
-            if skip_first > 0:
-                if len(raw_data) > skip_first:
-                    logger.info(f"⏭️  Skipping top {skip_first} results...")
-                    raw_data = raw_data[skip_first:]
-                else:
-                    logger.warning(f"⚠️  Only found {len(raw_data)} results, skipping all (skip_first={skip_first})")
-                    raw_data = []
-
-            # 2. Clean & Filter
-            cleaned_data = self.clean_data(raw_data, [query], exclude_domains)
-            all_clean_data.extend(cleaned_data)
-            
-            # Add new domains to exclusion set (dedup within session)
-            for item in cleaned_data:
-                if item.get('domain'):
-                    exclude_domains.add(item['domain'])
+        # 2. Clean & Filter
+        all_clean_data = self.clean_data(raw_data, search_queries, exclude_domains)
 
         # Deduplicate total list
         unique_data = []
@@ -1781,7 +1772,8 @@ class GoogleMapsLeadScraper:
         # Notify
         duration = time.time() - start_time
         msg = f"See: {sheet_url}" if sheet_url else f"CSV: {csv_file}"
-        notify_success(f"Scraped {len(final_data)} leads in {location}\n{msg}")
+        logger.info(f"✅ Scraped {len(final_data)} leads in {location}\n{msg}")
+        notify_success()
 
         return {
             "success": True,
