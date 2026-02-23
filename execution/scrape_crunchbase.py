@@ -23,11 +23,12 @@ Directive: directives/scrape_crunchbase_leads.md
 import os
 import sys
 import json
+import csv
 import time
 import re
 import argparse
 import logging
-from typing import List, Dict, Optional, Tuple
+from typing import Any, List, Dict, Optional, Tuple
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
@@ -71,6 +72,9 @@ class AnyMailFinder:
 
     def __init__(self, api_key: str):
         self.api_key = api_key
+        self.rate_limit_lock = Lock()
+        self.last_call_time = 0
+        self.min_delay = 0.2  # 5 req/sec
         logger.info("✓ AnyMailFinder (Company Email API) initialized")
 
     def find_company_emails(self, company_domain: str, company_name: str = None) -> Dict:
@@ -81,65 +85,91 @@ class AnyMailFinder:
         Returns:
             Dict with 'emails' list and 'status'
         """
-        try:
-            headers = {
-                'Authorization': self.api_key,
-                'Content-Type': 'application/json'
-            }
+        # Thread-safe rate limiting
+        with self.rate_limit_lock:
+            elapsed = time.time() - self.last_call_time
+            if elapsed < self.min_delay:
+                time.sleep(self.min_delay - elapsed)
+            self.last_call_time = time.time()
 
-            payload = {
-                'domain': company_domain,
-                'email_type': 'any'  # Get all types: generic + personal
-            }
+        for attempt in range(3):
+            try:
+                headers = {
+                    'Authorization': self.api_key,
+                    'Content-Type': 'application/json'
+                }
 
-            if company_name:
-                payload['company_name'] = company_name
+                payload = {
+                    'domain': company_domain,
+                    'email_type': 'any'  # Get all types: generic + personal
+                }
 
-            response = requests.post(
-                self.BASE_URL,
-                headers=headers,
-                json=payload,
-                timeout=15
-            )
+                if company_name:
+                    payload['company_name'] = company_name
 
-            if response.status_code == 200:
-                data = response.json()
+                response = requests.post(
+                    self.BASE_URL,
+                    headers=headers,
+                    json=payload,
+                    timeout=15
+                )
 
-                email_status = data.get('email_status', 'not_found')
+                if response.status_code == 200:
+                    data = response.json()
 
-                if email_status == 'valid' and data.get('valid_emails'):
-                    return {
-                        'emails': data['valid_emails'],
-                        'status': 'found',
-                        'count': len(data['valid_emails'])
-                    }
-                elif email_status == 'not_found':
-                    return {
-                        'emails': [],
-                        'status': 'not-found',
-                        'count': 0
-                    }
+                    email_status = data.get('email_status', 'not_found')
+
+                    if email_status == 'valid' and data.get('valid_emails'):
+                        return {
+                            'emails': data['valid_emails'],
+                            'status': 'found',
+                            'count': len(data['valid_emails'])
+                        }
+                    elif email_status == 'not_found':
+                        return {
+                            'emails': [],
+                            'status': 'not-found',
+                            'count': 0
+                        }
+                    else:
+                        return {
+                            'emails': [],
+                            'status': email_status,
+                            'count': 0
+                        }
+                elif response.status_code == 401:
+                    raise ValueError("❌ AnyMailFinder API key invalid (401 Unauthorized)")
+                elif response.status_code == 429:
+                    wait_time = 2 ** attempt
+                    logger.warning(f"⚠️ AnyMailFinder rate limited for {company_domain}, waiting {wait_time}s")
+                    time.sleep(wait_time)
+                    continue
                 else:
+                    logger.debug(f"API error for {company_domain}: {response.status_code}")
                     return {
                         'emails': [],
-                        'status': email_status,
+                        'status': f'error-{response.status_code}',
                         'count': 0
                     }
-            else:
-                logger.debug(f"API error for {company_domain}: {response.status_code}")
+
+            except ValueError:
+                raise  # Re-raise auth errors immediately
+            except Exception as e:
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                    continue
+                logger.debug(f"Error for {company_domain} after 3 attempts: {e}")
                 return {
                     'emails': [],
-                    'status': 'not-found',
+                    'status': 'error',
                     'count': 0
                 }
 
-        except Exception as e:
-            logger.debug(f"Error for {company_domain}: {e}")
-            return {
-                'emails': [],
-                'status': 'not-found',
-                'count': 0
-            }
+        return {
+            'emails': [],
+            'status': 'rate-limited',
+            'count': 0
+        }
 
 
 class RapidAPIGoogleSearch:
@@ -157,10 +187,11 @@ class RapidAPIGoogleSearch:
         logger.info(f"✓ RapidAPI Google Search initialized ({len(api_keys)} keys)")
 
     def _get_current_key(self) -> str:
-        """Rotate between API keys for higher throughput"""
-        key = self.api_keys[self.current_key_index]
-        self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
-        return key
+        """Rotate between API keys for higher throughput (thread-safe)"""
+        with self.rate_limit_lock:
+            key = self.api_keys[self.current_key_index]
+            self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
+            return key
 
     def _rate_limited_search(self, query: str, num_results: int = 10) -> Optional[Dict]:
         """Thread-safe rate-limited Google search"""
@@ -463,6 +494,16 @@ class CrunchbaseScraper:
             logger.info(f"  ✓ {key_name} loaded")
         return value
 
+    def _parse_cookies(self) -> list:
+        """Parse CRUNCHBASE_COOKIES JSON string with validation"""
+        try:
+            cookies = json.loads(self.crunchbase_cookies)
+            if not isinstance(cookies, list):
+                raise ValueError("CRUNCHBASE_COOKIES must be a JSON array")
+            return cookies
+        except json.JSONDecodeError as e:
+            raise ValueError(f"❌ CRUNCHBASE_COOKIES is not valid JSON: {e}")
+
     def _extract_domain_from_website(self, website: str) -> Optional[str]:
         """Extract clean domain from website URL"""
         if not website:
@@ -550,9 +591,16 @@ class CrunchbaseScraper:
 
         return ('', False, 0.2)
 
-    def _format_funding_stage(self, stage: str) -> str:
+    def _format_funding_stage(self, stage: Any) -> str:
         """Format funding stage for display (series_b → Series B)"""
         if not stage:
+            return ''
+
+        # Handle dict format from Crunchbase API (v4.1 fix)
+        if isinstance(stage, dict):
+            stage = stage.get('value', '') or stage.get('name', '') or ''
+
+        if not stage or not isinstance(stage, str):
             return ''
 
         # Common formatting mappings
@@ -593,7 +641,7 @@ class CrunchbaseScraper:
 
         return replacements.get(formatted, formatted)
 
-    def _format_funding_amount(self, amount: any) -> str:
+    def _format_funding_amount(self, amount: Any) -> str:
         """Format funding amount for display (1000000 → $1M)"""
         if not amount:
             return ''
@@ -621,7 +669,7 @@ class CrunchbaseScraper:
         else:
             return f"${amount:.0f}"
 
-    def _format_categories(self, categories: any) -> str:
+    def _format_categories(self, categories: Any) -> str:
         """Format categories for display"""
         if not categories:
             return ''
@@ -648,175 +696,180 @@ class CrunchbaseScraper:
         - vice president, vp, cfo, cto, coo, cmo
         - executive, c-suite, c-level, principal, partner
         """
-        if not job_title or len(job_title) < 3:
+        if not job_title or len(job_title) < 2:
             return False
 
         job_title_lower = job_title.lower()
 
-        decision_maker_keywords = [
+        # Word-boundary regex prevents partial matches (e.g. "viper" won't match "vp")
+        dm_pattern = r'\b(?:' + '|'.join([
             # C-Suite & Founders
-            'founder', 'co-founder', 'ceo', 'chief executive', 'chief',
-            'owner', 'president', 'cfo', 'cto', 'coo', 'cmo',
-            'c-suite', 'c-level',
+            r'founder', r'co-founder', r'ceo', r'chief executive', r'chief',
+            r'owner', r'president', r'cfo', r'cto', r'coo', r'cmo',
+            r'c-suite', r'c-level',
             # Vice Presidents & Directors
-            'vice president', 'vp ', 'director', 'executive director', 'managing director',
+            r'vice president', r'vp', r'svp', r'evp',
+            r'director', r'executive director', r'managing director',
             # Heads & Partners
-            'head of', 'managing partner', 'partner', 'principal',
+            r'head of', r'managing partner', r'partner', r'principal',
             # Executive roles
-            'executive'
-        ]
+            r'executive',
+        ]) + r')\b'
 
-        # Must contain at least one decision-maker keyword
-        has_dm_keyword = any(kw in job_title_lower for kw in decision_maker_keywords)
+        has_dm_keyword = bool(re.search(dm_pattern, job_title_lower))
 
         # Exclude non-decision-maker roles
-        exclude_keywords = [
-            'assistant', 'associate', 'junior', 'intern', 'coordinator',
-            'analyst', 'specialist', 'representative', 'agent', 'clerk',
-            'trainee', 'apprentice', 'student'
-        ]
+        exclude_pattern = r'\b(?:' + '|'.join([
+            r'assistant', r'associate', r'junior', r'intern', r'coordinator',
+            r'analyst', r'specialist', r'representative', r'agent', r'clerk',
+            r'trainee', r'apprentice', r'student',
+        ]) + r')\b'
 
-        has_exclude_keyword = any(kw in job_title_lower for kw in exclude_keywords)
+        has_exclude_keyword = bool(re.search(exclude_pattern, job_title_lower))
 
         return has_dm_keyword and not has_exclude_keyword
 
-    def scrape_companies(self, search_url: str, limit: int = 25) -> List[Dict]:
-        """Step 1: Scrape companies from Crunchbase using Apify"""
-        logger.info(f"⏳ Running Apify scraper (limit: {limit})...")
-
+    def _run_single_apify_batch(self, search_url: str, count: int, cursor: str, batch_label: str) -> List[Dict]:
+        """Run a single Apify batch and return items (excluding error items)"""
         run_input = {
             "search.url": search_url,
-            "count": limit,
+            "count": count,
             "minDelay": 1,
-            "maxDelay": 5,
-            "cookie": json.loads(self.crunchbase_cookies),  # Parse JSON string to list
-            "cursor": ""
+            "maxDelay": 3,
+            "cookie": self._parse_cookies(),
+            "cursor": cursor,
+            "proxy": {
+                "useApifyProxy": True,
+                "apifyProxyGroups": ["RESIDENTIAL"],
+                "apifyProxyCountry": "GB"
+            }
         }
 
-        run = self.apify_client.actor("curious_coder/crunchbase-scraper").call(run_input=run_input)
+        try:
+            run = self.apify_client.actor("curious_coder/crunchbase-scraper").call(run_input=run_input)
+        except Exception as e:
+            logger.error(f"  ❌ {batch_label} failed: {e}")
+            return []
 
         items = []
         for item in self.apify_client.dataset(run["defaultDatasetId"]).iterate_items():
+            # Skip error items from the actor
+            if 'error' in item and len(item) == 1:
+                logger.warning(f"  ⚠️ {batch_label}: {item.get('error', 'unknown error')}")
+                continue
             items.append(item)
 
-        logger.info(f"✓ Scraped {len(items)} companies from Crunchbase")
         return items
 
-    def _find_company_website(self, company_name: str, description: str) -> Optional[str]:
+    def scrape_companies(self, search_url: str, limit: int = 25) -> List[Dict]:
         """
-        Find company website using RapidAPI Google Search (>90% success rate target)
-        Uses multi-attempt strategy with fallback queries + two-pass homepage filtering
+        Step 1: Scrape companies from Crunchbase using Apify.
+        Uses PARALLEL batches to maximize throughput within the 5-min cookie window.
+        Launches all batches simultaneously with pre-computed cursor offsets.
         """
-        # Extract keywords from description
-        keywords = []
-        if description:
-            # Get first 50 words for keywords
-            desc_words = description.split()[:50]
-            desc_snippet = ' '.join(desc_words)
+        BATCH_SIZE = 15  # Apify actor max limit per run
+        num_batches = (limit + BATCH_SIZE - 1) // BATCH_SIZE  # Ceiling division
 
-            # Extract key business terms
-            business_terms = ['blockchain', 'crypto', 'fintech', 'software', 'platform',
-                            'technology', 'ai', 'defi', 'nft', 'web3', 'infrastructure',
-                            'payments', 'trading', 'security', 'wallet']
+        logger.info(f"⏳ Running Apify scraper (limit: {limit}, {num_batches} parallel batches of {BATCH_SIZE})...")
+        logger.info(f"  ⚡ Launching ALL batches in parallel to beat cookie expiration...")
 
-            for term in business_terms:
-                if term.lower() in desc_snippet.lower():
-                    keywords.append(term)
-                    if len(keywords) >= 3:
-                        break
+        # Pre-compute all batch parameters
+        batch_params = []
+        for i in range(num_batches):
+            offset = i * BATCH_SIZE
+            count = min(BATCH_SIZE, limit - offset)
+            cursor = str(offset) if offset > 0 else ""
+            batch_params.append((search_url, count, cursor, f"Batch {i+1}/{num_batches} (offset={offset})"))
 
-        # 3-attempt strategy for >90% success
-        search_attempts = [
-            # Attempt 1: Specific with keywords (most accurate)
-            (f'"{company_name}" {" ".join(keywords[:2])} official website' if keywords else f'"{company_name}" official website', 5),
-            # Attempt 2: Company name only (broader)
-            (f'"{company_name}" company website', 5),
-            # Attempt 3: Very broad (catches edge cases)
-            (f'{company_name} site', 7)
-        ]
+        # Launch ALL batches in parallel
+        all_items = []
+        seen_ids = set()
+        errors = 0
 
-        for attempt_num, (query, num_results) in enumerate(search_attempts, 1):
-            logger.info(f"  🔍 Search attempt {attempt_num}/3: {query}")
+        with ThreadPoolExecutor(max_workers=min(10, num_batches)) as executor:
+            futures = {
+                executor.submit(self._run_single_apify_batch, *params): params
+                for params in batch_params
+            }
 
-            search_result = self.search_client._rate_limited_search(query, num_results=num_results)
+            completed = 0
+            for future in as_completed(futures):
+                params = futures[future]
+                batch_label = params[3]
+                completed += 1
 
-            if not search_result or not search_result.get('results'):
-                continue
+                try:
+                    batch_items = future.result()
 
-            # Two-pass approach: Prefer homepage over subpages
-            homepage_result = None
-            subpage_result = None
+                    if not batch_items:
+                        errors += 1
+                        logger.info(f"  ⊘ {batch_label}: no results")
+                        continue
 
-            # Look for official website in results
-            for result in search_result['results']:
-                url = result.get('url', '')
-                title = result.get('title', '').lower()
+                    # Deduplicate
+                    new_count = 0
+                    for item in batch_items:
+                        company_id = item.get('identifier', '') or item.get('name', '') or str(item)
+                        if isinstance(company_id, dict):
+                            company_id = company_id.get('value', '') or company_id.get('permalink', '') or str(company_id)
+                        if company_id not in seen_ids:
+                            seen_ids.add(company_id)
+                            all_items.append(item)
+                            new_count += 1
 
-                # Skip social media, wikis, and documents (CRITICAL: prevents PDFs and news articles)
-                skip_patterns = ['linkedin.com', 'twitter.com', 'facebook.com',
-                               'crunchbase.com', 'wikipedia.org', 'youtube.com',
-                               'instagram.com', 'tiktok.com',
-                               '.pdf', '/documents/', '/notices/', '/files/', '/downloads/']
-                if any(x in url.lower() for x in skip_patterns):
-                    continue
+                    logger.info(f"  ✓ {batch_label}: got {new_count} companies (total: {len(all_items)})")
 
-                # Check if company name appears in title or URL
-                company_lower = company_name.lower()
+                except Exception as e:
+                    errors += 1
+                    logger.error(f"  ❌ {batch_label} error: {e}")
 
-                # Company name match logic
-                is_match = False
-                if attempt_num <= 2:
-                    # Strict match for first 2 attempts
-                    is_match = company_lower in title or company_lower in url.lower()
-                else:
-                    # Relaxed match for last attempt (partial match ok)
-                    company_words = company_lower.split()[:2]  # First 2 words of company name
-                    is_match = any(word in title or word in url.lower() for word in company_words if len(word) > 3)
+                # Progress update
+                if completed % max(1, num_batches // 5) == 0:
+                    logger.info(f"  ⏳ Batches: {completed}/{num_batches} done, {len(all_items)} companies collected")
 
-                if not is_match:
-                    continue
+        logger.info(f"✓ Scraped {len(all_items)} companies from Crunchbase ({num_batches} batches, {errors} errors)")
+        return all_items
 
-                # Detect if it's a subpage (careers, about, jobs, news, press, etc.)
-                subpage_patterns = ['/careers', '/jobs', '/about', '/team', '/contact', '/company',
-                                  '/news', '/press', '/blog', '/media', '/resources', '/solutions']
-                is_subpage = any(pattern in url.lower() for pattern in subpage_patterns)
+    def _safe_get_string(self, data: Any, *keys: str, default: str = '') -> str:
+        """
+        Safely extract string from potentially nested dict structures.
+        Crunchbase API v4.1+ returns dicts for many fields.
+        """
+        value = data
+        for key in keys:
+            if isinstance(value, dict):
+                value = value.get(key, default)
+            else:
+                break
 
-                domain = self._extract_domain_from_website(url)
+        # Handle dict with 'value' or 'name' key
+        if isinstance(value, dict):
+            value = value.get('value', '') or value.get('name', '') or value.get('identifier', '') or ''
 
-                if is_subpage:
-                    # Save as backup
-                    if not subpage_result:
-                        subpage_result = domain
-                        logger.info(f"  → Found subpage (backup): {domain}")
-                else:
-                    # Prefer homepage (root domain or short path)
-                    homepage_result = domain
-                    logger.info(f"  ✓ Found homepage (attempt {attempt_num}): {domain}")
-                    break  # Found homepage, stop searching this attempt
+        # Handle list of dicts
+        if isinstance(value, list) and value:
+            first_item = value[0]
+            if isinstance(first_item, dict):
+                value = first_item.get('value', '') or first_item.get('name', '') or ''
+            else:
+                value = str(first_item)
 
-            # Return homepage if found, otherwise fallback to subpage
-            if homepage_result:
-                return homepage_result
-            elif subpage_result:
-                logger.info(f"  ⚠️ Using subpage as fallback: {subpage_result}")
-                return subpage_result
-
-        logger.info(f"  ✗ Website not found after 3 attempts")
-        return None
+        return str(value) if value else default
 
     def enrich_single_company(self, company: Dict) -> List[Dict]:
         """
         Enrich single company following email-first workflow:
-        1. Find company website via Google Search (if not provided)
+        1. Get website from Crunchbase (no search needed)
         2. Find emails (AnyMailFinder)
         3. Extract names from emails
         4. Search LinkedIn by name
         5. Validate if decision-maker
         6. Return list of decision-makers with emails
         """
-        company_name = company.get('name', '')
-        website = company.get('website', '')
-        description = company.get('description', '') or company.get('short_description', '')
+        # Safe extraction of company data (handles Crunchbase API v4.1+ dict format)
+        company_name = self._safe_get_string(company, 'identifier', default='') or self._safe_get_string(company, 'name', default='')
+        website = self._safe_get_string(company, 'website', default='')
+        description = self._safe_get_string(company, 'description', default='') or self._safe_get_string(company, 'short_description', default='')
 
         if not company_name:
             return []
@@ -824,17 +877,13 @@ class CrunchbaseScraper:
         logger.info(f"\n{'='*70}")
         logger.info(f"🏢 Company: {company_name}")
 
-        # Step 1: Get website domain (from Crunchbase or search)
-        if website:
-            domain = self._extract_domain_from_website(website)
-            logger.info(f"  ✓ Website from Crunchbase: {domain}")
-        else:
-            # Search for website using company name + description keywords
-            domain = self._find_company_website(company_name, description)
-
-        if not domain:
-            logger.info(f"  ⊘ No website domain - skipping")
+        # Step 1: Get website domain directly from Crunchbase (v4.2 - no search needed)
+        if not website:
+            logger.info(f"  ⊘ No website in Crunchbase - skipping")
             return []
+
+        domain = self._extract_domain_from_website(website)
+        logger.info(f"  ✓ Website: {domain}")
 
         # Step 1: Find ALL emails at company (up to 20)
         logger.info(f"  📧 Finding emails at {domain}...")
@@ -891,29 +940,68 @@ class CrunchbaseScraper:
                 logger.info(f"  ✗ Not a decision-maker: {job_title}")
                 return None
 
-            # New format: 13 columns as per directive (formatted for display)
-            # Extract location from Crunchbase data
+            # EXPANDED OUTPUT: All available Crunchbase fields (v4.2)
+            # Extract location from Crunchbase data (handles v4.1+ dict format)
             location_data = company.get('location_identifiers', [])
             if isinstance(location_data, list) and location_data:
                 # Get first location's value
-                location = location_data[0].get('value', '') if isinstance(location_data[0], dict) else str(location_data[0])
+                first_loc = location_data[0]
+                if isinstance(first_loc, dict):
+                    location = first_loc.get('value', '') or first_loc.get('name', '') or ''
+                else:
+                    location = str(first_loc)
             else:
-                location = company.get('location', '')
+                location = self._safe_get_string(company, 'location', default='')
+
+            # Safe extraction of all company fields (Crunchbase v4.1+ compatibility)
+            funding_stage_raw = company.get('last_funding_type') or company.get('funding_stage') or ''
+            total_funding_raw = company.get('funding_total') or company.get('total_funding') or ''
+            last_funding_date_raw = company.get('last_funding_at') or company.get('last_funding_date') or ''
+            description_raw = company.get('description') or company.get('short_description') or ''
+            categories_raw = company.get('categories') or ''
+
+            # Additional fields from Crunchbase (v4.2)
+            last_equity_funding_raw = company.get('last_equity_funding_total') or ''
+            last_funding_total_raw = company.get('last_funding_total') or ''
 
             dm = {
+                # Contact info (person)
                 'company_name': company_name,
                 'first_name': full_name.split()[0] if full_name else '',
                 'last_name': ' '.join(full_name.split()[1:]) if len(full_name.split()) > 1 else '',
                 'job_title': job_title,
                 'email': email,
                 'linkedin_url': linkedin_url,
-                'website': domain,  # Use domain instead of website variable
+
+                # Company basic info
+                'website': domain,
                 'location': location,
-                'funding_stage': self._format_funding_stage(company.get('last_funding_type', '')),
-                'total_funding': self._format_funding_amount(company.get('total_funding', '')),
-                'last_funding_date': company.get('last_funding_date', ''),
-                'description': company.get('description', ''),
-                'categories': self._format_categories(company.get('categories', ''))
+                'phone_number': self._safe_get_string(company, 'phone_number', default=''),
+                'company_email': self._safe_get_string(company, 'contact_email', default=''),
+                'company_linkedin': self._safe_get_string(company, 'linkedin', default=''),
+                'company_facebook': self._safe_get_string(company, 'facebook', default=''),
+
+                # Company details
+                'founded_on': self._safe_get_string(company, 'founded_on', default=''),
+                'operating_status': self._safe_get_string(company, 'operating_status', default=''),
+                'company_type': self._safe_get_string(company, 'company_type', default=''),
+                'num_contacts': self._safe_get_string(company, 'num_contacts', default=''),
+
+                # Scores & rankings
+                'rank_org_company': self._safe_get_string(company, 'rank_org_company', default=''),
+                'heat_score_tier': self._safe_get_string(company, 'heat_score_tier', default=''),
+                'growth_score_tier': self._safe_get_string(company, 'growth_score_tier', default=''),
+
+                # Funding info
+                'funding_stage': self._format_funding_stage(funding_stage_raw),
+                'total_funding': self._format_funding_amount(total_funding_raw),
+                'last_funding_date': self._safe_get_string({'v': last_funding_date_raw}, 'v', default=''),
+                'last_funding_total': self._format_funding_amount(last_funding_total_raw),
+                'last_equity_funding': self._format_funding_amount(last_equity_funding_raw),
+
+                # Description & categories
+                'description': self._safe_get_string({'v': description_raw}, 'v', default=''),
+                'categories': self._format_categories(categories_raw)
             }
 
             logger.info(f"  ★ Found decision-maker: {full_name} ({job_title})")
@@ -938,10 +1026,11 @@ class CrunchbaseScraper:
         return decision_makers
 
     def enrich_companies(self, companies: List[Dict], max_workers: int = 10) -> List[Dict]:
-        """Parallel enrichment of all companies"""
+        """Parallel enrichment of all companies with cross-company email dedup"""
         logger.info(f"\n⏳ Enriching {len(companies)} companies (parallel workers: {max_workers})...")
 
         all_decision_makers = []
+        seen_emails = set()
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
@@ -957,7 +1046,13 @@ class CrunchbaseScraper:
 
                 try:
                     decision_makers = future.result()
-                    all_decision_makers.extend(decision_makers)
+                    for dm in decision_makers:
+                        email = dm.get('email', '').lower()
+                        if email and email not in seen_emails:
+                            seen_emails.add(email)
+                            all_decision_makers.append(dm)
+                        elif email:
+                            logger.debug(f"  ⊘ Duplicate email across companies: {email}")
                 except Exception as e:
                     logger.error(f"  ❌ Error processing {company.get('name', 'unknown')}: {str(e)}")
 
@@ -972,8 +1067,6 @@ class CrunchbaseScraper:
 
     def export_to_csv(self, leads: List[Dict], filename: Optional[str] = None) -> str:
         """Export leads to CSV"""
-        import csv
-
         if filename is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"crunchbase_leads_{timestamp}.csv"
@@ -1121,7 +1214,8 @@ class CrunchbaseScraper:
             return ""
 
         # Step 2: Enrich (email-first workflow)
-        leads = self.enrich_companies(companies, max_workers=10)
+        # max_workers=3 because each company spawns 5 inner threads (3×5=15 total)
+        leads = self.enrich_companies(companies, max_workers=3)
 
         if not leads:
             logger.warning("⚠️  No decision-makers found with emails")

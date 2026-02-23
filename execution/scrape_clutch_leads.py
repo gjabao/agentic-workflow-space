@@ -27,8 +27,10 @@ import sys
 import json
 import time
 import re
+import csv
 import argparse
 import logging
+import traceback
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -44,6 +46,7 @@ try:
     from google_auth_oauthlib.flow import InstalledAppFlow
     from google.auth.transport.requests import Request
     from dotenv import load_dotenv
+    from utils_notifications import notify_success, notify_error
 except ImportError as e:
     print(f"❌ Missing dependency: {e}")
     print("Install: pip install apify-client requests google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client python-dotenv")
@@ -53,9 +56,14 @@ except ImportError as e:
 load_dotenv()
 
 # Configure logging
+os.makedirs('.tmp', exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
-    format='%(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('.tmp/clutch_scraper.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -153,24 +161,34 @@ class RapidAPIGoogleSearch:
     def __init__(self, api_keys: List[str]):
         self.api_keys = api_keys
         self.current_key_index = 0
+        self.key_lock = Lock()  # Thread-safe key rotation
         self.rate_limit_lock = Lock()
         self.last_call_time = 0
         self.min_delay = 0.2  # 5 req/sec per key
         logger.info(f"✓ RapidAPI Google Search initialized ({len(api_keys)} keys)")
 
     def _get_current_key(self) -> str:
-        """Rotate between API keys for higher throughput"""
-        key = self.api_keys[self.current_key_index]
-        self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
-        return key
+        """Rotate between API keys for higher throughput (thread-safe)"""
+        with self.key_lock:
+            key = self.api_keys[self.current_key_index]
+            self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
+            return key
 
     def _rate_limited_search(self, query: str, num_results: int = 10) -> Optional[Dict]:
         """Thread-safe rate-limited Google search"""
+        # Calculate wait time inside lock, sleep outside to avoid blocking other threads
+        wait_time = 0
         with self.rate_limit_lock:
             elapsed = time.time() - self.last_call_time
             if elapsed < self.min_delay:
-                time.sleep(self.min_delay - elapsed)
-            self.last_call_time = time.time()
+                wait_time = self.min_delay - elapsed
+            else:
+                self.last_call_time = time.time()
+
+        if wait_time > 0:
+            time.sleep(wait_time)
+            with self.rate_limit_lock:
+                self.last_call_time = time.time()
 
         for attempt in range(3):
             try:
@@ -478,6 +496,14 @@ class ClutchScraper:
 
         return domain
 
+    def validate_email_domain(self, email: str, expected_domain: str) -> bool:
+        """Validate that email domain matches expected company domain."""
+        if not email or '@' not in email:
+            return False
+        email_domain = email.split('@')[1].lower()
+        expected_clean = expected_domain.lower().replace('www.', '')
+        return email_domain == expected_clean
+
     def extract_contact_from_email(self, email: str) -> Tuple[str, bool, float]:
         """
         Extract name from email and classify as generic/personal
@@ -678,8 +704,11 @@ class ClutchScraper:
         logger.info(f"  📧 Finding emails at {domain}...")
         email_result = self.email_enricher.find_company_emails(domain, company_name)
 
-        emails = email_result.get('emails', [])
-        logger.info(f"  ✓ Found {len(emails)} emails")
+        raw_emails = email_result.get('emails', [])
+
+        # Filter: only keep emails matching the company domain
+        emails = [e for e in raw_emails if self.validate_email_domain(e, domain)]
+        logger.info(f"  ✓ Found {len(emails)} emails matching domain (filtered from {len(raw_emails)} raw)")
 
         if not emails:
             logger.info(f"  ⊘ No emails found - skipping")
@@ -811,11 +840,10 @@ class ClutchScraper:
 
     def export_to_csv(self, leads: List[Dict], filename: Optional[str] = None) -> str:
         """Export leads to CSV"""
-        import csv
 
         if filename is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"clutch_leads_{timestamp}.csv"
+            filename = f".tmp/clutch_leads_{timestamp}.csv"
 
         logger.info(f"⏳ Exporting to CSV: {filename}...")
 
@@ -927,6 +955,13 @@ class ClutchScraper:
                 body={'requests': requests_format}
             ).execute()
 
+            # Share with anyone who has the link
+            drive_service = build('drive', 'v3', credentials=creds)
+            drive_service.permissions().create(
+                fileId=spreadsheet_id,
+                body={'type': 'anyone', 'role': 'reader'}
+            ).execute()
+
             logger.info(f"✓ Exported {len(leads)} rows to Google Sheets")
 
             return spreadsheet_url
@@ -960,7 +995,8 @@ class ClutchScraper:
             return ""
 
         # Step 2: Enrich (email-first workflow)
-        leads = self.enrich_companies(companies, max_workers=20)
+        # 10 outer workers × 10 inner workers = 100 threads max (safe for rate limiter)
+        leads = self.enrich_companies(companies, max_workers=10)
 
         if not leads:
             logger.warning("⚠️  No decision-makers found with emails")
@@ -988,12 +1024,17 @@ class ClutchScraper:
         logger.info("=" * 70)
         logger.info(f"Companies scraped:          {len(companies)}")
         logger.info(f"Decision-makers with emails: {len(leads)}")
-        logger.info(f"Success rate:               {len(leads)/len(companies)*100:.0f}%")
+        logger.info(f"Coverage rate:              {len(leads)/len(companies)*100:.0f}% ({len(leads)/len(companies):.1f} DMs/company)")
         logger.info(f"Duration:                   {duration:.1f}s")
         logger.info("=" * 70)
 
         if sheet_url:
             logger.info(f"\n✅ Complete! Google Sheet: {sheet_url}")
+
+        if leads:
+            notify_success()
+        else:
+            notify_error()
 
         return sheet_url or csv_file
 
@@ -1025,8 +1066,8 @@ def main():
         sys.exit(1)
     except Exception as e:
         logger.error(f"❌ Fatal error: {str(e)}")
-        import traceback
         traceback.print_exc()
+        notify_error()
         sys.exit(1)
 
 

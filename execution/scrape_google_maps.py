@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Google Maps Lead Scraper v7.0 - RapidAPI Edition
+Google Maps Lead Scraper v7.2 - RapidAPI Edition (Security + Performance hardened)
 Exports ALL contacts with LinkedIn titles (max 10 per company)
 Uses RapidAPI Google Search for accurate contact enrichment
 Follows directives/scrape_google_maps_leads.md workflow exactly
@@ -19,11 +19,10 @@ from typing import Dict, List, Optional, Any
 from datetime import datetime
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
+from threading import Lock, Semaphore
 from difflib import SequenceMatcher
 from dotenv import load_dotenv
 from apify_client import ApifyClient
-from exa_py import Exa
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
@@ -49,20 +48,25 @@ class RapidAPIGoogleSearch:
     """RapidAPI Google Search - For LinkedIn profile enrichment."""
 
     def __init__(self, api_keys: List[str]):
-        self.api_keys = api_keys
-        self.current_key_index = 0
+        self._api_keys = list(api_keys)  # Private, not exposed via self.api_keys
+        self._current_key_index = 0
         self.rate_limit_lock = Lock()
         self.last_call_time = 0
         self.min_delay = 0.2  # 5 req/sec per key
+        self._num_keys = len(api_keys)
         logger.info(f"✓ RapidAPI Google Search initialized")
-        logger.info(f"  → Keys: {len(api_keys)}")
+        logger.info(f"  → Keys: {self._num_keys}")
         logger.info(f"  → Rate: 5 req/sec per key")
 
+    def __repr__(self):
+        return f"<RapidAPIGoogleSearch keys={self._num_keys}>"
+
     def _get_current_key(self) -> str:
-        """Rotate between API keys for higher throughput."""
-        key = self.api_keys[self.current_key_index]
-        self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
-        return key
+        """Thread-safe rotation between API keys."""
+        with self.rate_limit_lock:
+            key = self._api_keys[self._current_key_index]
+            self._current_key_index = (self._current_key_index + 1) % len(self._api_keys)
+            return key
 
     def _rate_limited_search(self, query: str, num_results: int = 10) -> Optional[Dict]:
         """Thread-safe rate-limited Google search."""
@@ -164,6 +168,9 @@ class RapidAPIGoogleSearch:
 
 class RapidAPIContactEnricher(RapidAPIGoogleSearch):
     """Extended RapidAPI search with contact enrichment methods."""
+
+    def __repr__(self):
+        return f"<RapidAPIContactEnricher keys={self._num_keys}>"
 
     def search_by_name(self, full_name: str, company_name: str, location: str = None) -> Dict:
         """
@@ -348,7 +355,7 @@ class RapidAPIContactEnricher(RapidAPIGoogleSearch):
             'skin tightening', 'treatments', 'facials', 'massage', 'laser',
             'claim business', 'request', 'contact us', 'about us', 'your role',
             'health centre', 'health professionals', 'medical clinic', 'medical group',
-            'hair by design', 'inside out',  # Specific company names
+            'hair by design', 'inside out',
         ]
 
         for indicator in garbage_indicators:
@@ -431,18 +438,8 @@ class RapidAPIContactEnricher(RapidAPIGoogleSearch):
         logger.info(f"  ✗ Founder not found after 2 attempts.")
         return result
 
-        if data and data.get('results'):
-            found = self._process_founder_results(data['results'], company_name, threshold=0.6)
-            if found['full_name']:
-                return found
-
-        # STRICT: If LinkedIn not found, return empty (no garbage acceptance)
-        # GPT-4 web search removed after testing (0/32 success rate)
-        logger.info(f"  ✗ LinkedIn not found for founder/decision maker - skipping (no garbage acceptance)")
-        return result
-
     def _process_founder_results(self, results: List[Dict], company_name: str,
-                                  threshold: float = 0.6, allow_non_linkedin: bool = True) -> Dict:
+                                  threshold: float = 0.6) -> Dict:
         """
         Process search results to find founder/decision maker.
         Two-pass strategy:
@@ -606,7 +603,6 @@ class RapidAPIContactEnricher(RapidAPIGoogleSearch):
         if company_name:
             # Extract domain from URL
             try:
-                from urllib.parse import urlparse
                 domain = urlparse(url).netloc.lower()
                 # Remove www.
                 if domain.startswith('www.'):
@@ -624,7 +620,7 @@ class RapidAPIContactEnricher(RapidAPIGoogleSearch):
                     
                     if company_clean in domain_clean or domain_clean in company_clean:
                         return True
-            except:
+            except (ValueError, AttributeError):
                 pass
         
         return False
@@ -691,8 +687,49 @@ class AnyMailFinder:
     BASE_URL = "https://api.anymailfinder.com/v5.1/find-email/company"
 
     def __init__(self, api_key: str):
-        self.api_key = api_key
+        # Load-Use-Delete: store auth in session header, not as attribute
+        self._session = requests.Session()
+        self._session.headers.update({
+            'Authorization': api_key,
+            'Content-Type': 'application/json'
+        })
+        del api_key  # Clear from local scope
+        # Rate limiting
+        self._rate_lock = Lock()
+        self._last_call = 0
+        self._min_delay = 0.2  # 5 req/sec max
         logger.info("✓ AnyMailFinder (Company Email API) initialized")
+
+    def __repr__(self):
+        return "<AnyMailFinder initialized>"
+
+    def _rate_limited_request(self, payload: Dict) -> Optional[requests.Response]:
+        """Thread-safe rate-limited request with retry on 429."""
+        with self._rate_lock:
+            elapsed = time.time() - self._last_call
+            if elapsed < self._min_delay:
+                time.sleep(self._min_delay - elapsed)
+            self._last_call = time.time()
+
+        for attempt in range(3):
+            try:
+                response = self._session.post(self.BASE_URL, json=payload, timeout=15)
+                if response.status_code == 429:
+                    wait_time = 2 ** attempt
+                    logger.debug(f"⚠️ AnyMailFinder rate limited, waiting {wait_time}s")
+                    time.sleep(wait_time)
+                    continue
+                return response
+            except requests.Timeout:
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                    continue
+                logger.debug(f"AnyMailFinder timeout after 3 attempts")
+                return None
+            except Exception as e:
+                logger.debug(f"AnyMailFinder request error: {e}")
+                return None
+        return None
 
     def find_company_emails(self, company_domain: str, company_name: str = None) -> Dict:
         """
@@ -702,65 +739,33 @@ class AnyMailFinder:
         Returns:
             Dict with 'emails' list and 'status'
         """
-        try:
-            headers = {
-                'Authorization': self.api_key,
-                'Content-Type': 'application/json'
-            }
+        payload = {
+            'domain': company_domain,
+            'email_type': 'any'  # Get all types: generic + personal
+        }
 
-            payload = {
-                'domain': company_domain,
-                'email_type': 'any'  # Get all types: generic + personal
-            }
+        if company_name:
+            payload['company_name'] = company_name
 
-            if company_name:
-                payload['company_name'] = company_name
+        response = self._rate_limited_request(payload)
 
-            response = requests.post(
-                self.BASE_URL,
-                headers=headers,
-                json=payload,
-                timeout=15
-            )
+        if response is None:
+            return {'emails': [], 'status': 'not-found', 'count': 0}
 
-            if response.status_code == 200:
-                data = response.json()
+        if response.status_code == 200:
+            data = response.json()
+            email_status = data.get('email_status', 'not_found')
 
-                email_status = data.get('email_status', 'not_found')
-
-                if email_status == 'valid' and data.get('valid_emails'):
-                    return {
-                        'emails': data['valid_emails'],
-                        'status': 'found',
-                        'count': len(data['valid_emails'])
-                    }
-                elif email_status == 'not_found':
-                    return {
-                        'emails': [],
-                        'status': 'not-found',
-                        'count': 0
-                    }
-                else:
-                    return {
-                        'emails': [],
-                        'status': email_status,
-                        'count': 0
-                    }
-            else:
-                logger.debug(f"API error for {company_domain}: {response.status_code}")
+            if email_status == 'valid' and data.get('valid_emails'):
                 return {
-                    'emails': [],
-                    'status': 'not-found',
-                    'count': 0
+                    'emails': data['valid_emails'],
+                    'status': 'found',
+                    'count': len(data['valid_emails'])
                 }
-
-        except Exception as e:
-            logger.debug(f"Error for {company_domain}: {e}")
-            return {
-                'emails': [],
-                'status': 'not-found',
-                'count': 0
-            }
+            return {'emails': [], 'status': email_status or 'not-found', 'count': 0}
+        else:
+            logger.debug(f"API error for {company_domain}: {response.status_code}")
+            return {'emails': [], 'status': 'not-found', 'count': 0}
 
 
 class GoogleMapsLeadScraper:
@@ -770,37 +775,36 @@ class GoogleMapsLeadScraper:
     SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
 
     def __init__(self):
-        self.apify_token = os.getenv("APIFY_API_KEY")
-        self.anymailfinder_token = os.getenv("ANYMAILFINDER_API_KEY")
-        self.exa_token = os.getenv("EXA_API_KEY")
+        # Load-Use-Delete pattern for all API keys
+        apify_token = os.getenv("APIFY_API_KEY")
+        if not apify_token:
+            raise ValueError("APIFY_API_KEY not found in .env")
+        self.apify_client = ApifyClient(apify_token)
+        del apify_token
 
-        if not self.apify_token:
-            raise ValueError("APIFY_API_KEY not found")
-
-        if not self.anymailfinder_token:
+        amf_token = os.getenv("ANYMAILFINDER_API_KEY")
+        if not amf_token:
             logger.warning("⚠️ ANYMAILFINDER_API_KEY not found")
             self.email_enricher = None
         else:
-            self.email_enricher = AnyMailFinder(self.anymailfinder_token)
+            self.email_enricher = AnyMailFinder(amf_token)
+            del amf_token
 
-        # Use RapidAPI Google Search for LinkedIn enrichment
-        rapidapi_keys = [
-            os.getenv("RAPIDAPI_KEY"),
-            os.getenv("RAPIDAPI_KEY_2")
-        ]
-        rapidapi_keys = [k for k in rapidapi_keys if k]  # Filter None values
-
+        rapidapi_keys = [k for k in [os.getenv("RAPIDAPI_KEY"), os.getenv("RAPIDAPI_KEY_2")] if k]
         if not rapidapi_keys:
             logger.warning("⚠️ RAPIDAPI_KEY not found - contact enrichment disabled")
             self.search_client = None
         else:
             self.search_client = RapidAPIContactEnricher(rapidapi_keys)
+            del rapidapi_keys
 
-        self.apify_client = ApifyClient(self.apify_token)
         self.output_dir = '.tmp/scraped_data'
         os.makedirs(self.output_dir, exist_ok=True)
 
-        logger.info("✓ GoogleMapsLeadScraper initialized (RapidAPI v7.0)")
+        logger.info("✓ GoogleMapsLeadScraper initialized (RapidAPI v7.2)")
+
+    def __repr__(self):
+        return "<GoogleMapsLeadScraper initialized>"
 
     def load_existing_domains(self, csv_path: str) -> set:
         """
@@ -923,50 +927,6 @@ class GoogleMapsLeadScraper:
 
         # Default: Valid but unclassified
         return (True, 'Other')
-
-    def fuzzy_match_company(self, company1: str, company2: str, threshold: float = 0.6) -> tuple:
-        """
-        Fuzzy string matching for company names using Levenshtein-based similarity.
-        Returns: (match_score, is_match)
-
-        Algorithm: SequenceMatcher (based on Gestalt Pattern Matching)
-        - Handles typos, abbreviations, extra words
-        - Normalizes whitespace and case
-        - threshold: 0.6 = 60% similarity required (configurable)
-
-        Examples:
-        - "Happy Skin Esthetics" vs "Happy Skin Esthetics Clinic" → 0.92 (MATCH)
-        - "ABC Corp" vs "ABC Corporation" → 0.85 (MATCH)
-        - "Google" vs "Facebook" → 0.0 (NO MATCH)
-        """
-        if not company1 or not company2:
-            return (0.0, False)
-
-        # Normalize both company names
-        def normalize(text: str) -> str:
-            # Convert to lowercase
-            text = text.lower()
-            # Remove common company suffixes
-            suffixes = ['inc', 'llc', 'ltd', 'corp', 'corporation', 'company', 'co', 'clinic', 'center']
-            for suffix in suffixes:
-                text = re.sub(rf'\b{suffix}\.?\b', '', text)
-            # Normalize whitespace
-            text = re.sub(r'\s+', ' ', text).strip()
-            # Remove special characters
-            text = re.sub(r'[^\w\s]', '', text)
-            return text
-
-        normalized1 = normalize(company1)
-        normalized2 = normalize(company2)
-
-        # Calculate similarity ratio (0.0 to 1.0)
-        matcher = SequenceMatcher(None, normalized1, normalized2)
-        match_score = matcher.ratio()
-
-        # Check if match exceeds threshold
-        is_match = match_score >= threshold
-
-        return (match_score, is_match)
 
     def extract_contact_from_email(self, email: str) -> tuple:
         """
@@ -1265,8 +1225,8 @@ class GoogleMapsLeadScraper:
 
         logger.info(f"📧 Enriching {len(leads)} companies (parallel)...")
 
-        # 20 workers for maximum speed
-        with ThreadPoolExecutor(max_workers=20) as executor:
+        # 10 workers (aligned with AnyMailFinder rate limit)
+        with ThreadPoolExecutor(max_workers=10) as executor:
             future_to_lead = {executor.submit(self.enrich_single_lead, lead): lead for lead in leads}
 
             enriched_leads = []
@@ -1397,9 +1357,9 @@ class GoogleMapsLeadScraper:
             contact_linkedin = ''
             
             if contact_info:
-               full_name = contact_info.get('full_name', '')
-               job_title = contact_info.get('job_title', '')
-               contact_linkedin = contact_info.get('contact_linkedin', '')
+                full_name = contact_info.get('full_name', '')
+                job_title = contact_info.get('job_title', '')
+                contact_linkedin = contact_info.get('contact_linkedin', '')
             
             logger.info(f"  ✓ Result: name={full_name}, title={job_title}, linkedin={bool(contact_linkedin)}")
 
@@ -1692,7 +1652,7 @@ class GoogleMapsLeadScraper:
         start_time = time.time()
 
         print("\n" + "="*70)
-        print("🚀 GOOGLE MAPS LEAD SCRAPER v7.1 - BATCH MODE")
+        print("🚀 GOOGLE MAPS LEAD SCRAPER v7.2 - BATCH MODE")
         print(f"Searches: {len(search_queries)} keywords")
         print(f"Location: {location}")
         print(f"Target: {max_results} results per search")
@@ -1786,7 +1746,7 @@ class GoogleMapsLeadScraper:
 
 def main():
     """Main CLI - Following MD file usage."""
-    parser = argparse.ArgumentParser(description='Google Maps Lead Scraper v3.2 - All Contacts')
+    parser = argparse.ArgumentParser(description='Google Maps Lead Scraper v7.2 - All Contacts')
     parser.add_argument('--location', type=str, required=True, help='Location (e.g., "Calgary, Canada")')
     parser.add_argument('--searches', nargs='+', required=True, help='Search queries (e.g., "medical aesthetic clinic" "med spa")')
     parser.add_argument('--limit', type=int, default=50, help='Max results per search (default: 50)')

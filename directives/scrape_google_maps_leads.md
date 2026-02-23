@@ -424,11 +424,11 @@ python execution/scrape_google_maps.py --location "Vancouver, Canada" --searches
 **API Configuration (.env):**
 ```bash
 # NEW - RapidAPI Google Search (2 keys for higher throughput)
-RAPIDAPI_KEY=766ecb90dcmsh65f84b2deca8789p161d10jsncd98ddab7aa7
-RAPIDAPI_KEY_2=fba18bda68msh647398ea4633bc0p1aec9fjsn5dd3ef1bc804
+RAPIDAPI_KEY=xxxxx
+RAPIDAPI_KEY_2=xxxxx
 
 # DEPRECATED - No longer used
-# EXA_API_KEY=26f7d167-453f-4c6d-8312-707a06bc7b88
+# EXA_API_KEY=xxxxx
 ```
 
 **Performance Results (Calgary, 20 companies):**

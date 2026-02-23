@@ -16,6 +16,7 @@ import json
 import logging
 import time
 import re
+import argparse
 import requests
 import pandas as pd
 from typing import Dict, List, Optional, Generator, Tuple
@@ -56,82 +57,93 @@ logger = logging.getLogger(__name__)
 class AnyMailFinder:
     """
     Company Email Finder - Returns ALL emails at a company (up to 20)
-    Migrated from Crunchbase scraper v4.0
+    Hardened with rate limiting, retry logic, and proper error handling.
     """
 
     BASE_URL = "https://api.anymailfinder.com/v5.1/find-email/company"
 
     def __init__(self, api_key: str):
         self.api_key = api_key
-        logger.info("✓ AnyMailFinder Company API initialized (v2.0)")
+        self.rate_limit_lock = Lock()
+        self.last_call_time = 0
+        self.min_delay = 0.5  # 2 req/sec
+        logger.info("✓ AnyMailFinder Company API initialized (v2.1 hardened)")
 
     def find_company_emails(self, company_domain: str, company_name: str = None) -> Dict:
         """
         Find ALL emails at a company in ONE call.
-        Returns up to 20 emails per company!
-
-        Returns:
-            Dict with 'emails' list and 'status'
+        Returns up to 20 emails per company.
+        Includes rate limiting, 3-attempt retry, and proper error handling.
         """
-        try:
-            headers = {
-                'Authorization': self.api_key,
-                'Content-Type': 'application/json'
-            }
+        not_found = {'emails': [], 'status': 'not-found', 'count': 0}
 
-            payload = {
-                'domain': company_domain,
-                'email_type': 'any'  # Get all types: generic + personal
-            }
+        # Rate limiting (reserve slot pattern)
+        with self.rate_limit_lock:
+            elapsed = time.time() - self.last_call_time
+            wait_time = max(0, self.min_delay - elapsed)
+            self.last_call_time = time.time() + wait_time
+        if wait_time > 0:
+            time.sleep(wait_time)
 
-            if company_name:
-                payload['company_name'] = company_name
+        headers = {
+            'Authorization': self.api_key,
+            'Content-Type': 'application/json'
+        }
 
-            response = requests.post(
-                self.BASE_URL,
-                headers=headers,
-                json=payload,
-                timeout=15
-            )
+        payload = {
+            'domain': company_domain,
+            'email_type': 'any'
+        }
 
-            if response.status_code == 200:
-                data = response.json()
+        if company_name:
+            payload['company_name'] = company_name
 
-                email_status = data.get('email_status', 'not_found')
+        for attempt in range(3):
+            try:
+                response = requests.post(
+                    self.BASE_URL,
+                    headers=headers,
+                    json=payload,
+                    timeout=20
+                )
 
-                if email_status == 'valid' and data.get('valid_emails'):
-                    return {
-                        'emails': data['valid_emails'],
-                        'status': 'found',
-                        'count': len(data['valid_emails'])
-                    }
-                elif email_status == 'not_found':
-                    return {
-                        'emails': [],
-                        'status': 'not-found',
-                        'count': 0
-                    }
+                if response.status_code == 200:
+                    data = response.json()
+                    email_status = data.get('email_status', 'not_found')
+
+                    if email_status == 'valid' and data.get('valid_emails'):
+                        return {
+                            'emails': data['valid_emails'],
+                            'status': 'found',
+                            'count': len(data['valid_emails'])
+                        }
+                    return {'emails': [], 'status': email_status or 'not-found', 'count': 0}
+
+                elif response.status_code == 401:
+                    logger.error(f"  ❌ AnyMailFinder 401 - Invalid API key")
+                    return not_found
+
+                elif response.status_code == 429:
+                    wait = 2 ** attempt
+                    logger.debug(f"  ⚠️ AnyMailFinder 429 rate limit, waiting {wait}s (attempt {attempt+1})")
+                    time.sleep(wait)
+                    continue
+
                 else:
-                    return {
-                        'emails': [],
-                        'status': email_status,
-                        'count': 0
-                    }
-            else:
-                logger.debug(f"  ⚠️ API error for {company_domain}: {response.status_code}")
-                return {
-                    'emails': [],
-                    'status': 'not-found',
-                    'count': 0
-                }
+                    logger.debug(f"  ⚠️ AnyMailFinder {response.status_code} for {company_domain}")
+                    if attempt < 2:
+                        time.sleep(2 ** attempt)
+                        continue
+                    return not_found
 
-        except Exception as e:
-            logger.debug(f"  ⚠️ Error for {company_domain}: {e}")
-            return {
-                'emails': [],
-                'status': 'not-found',
-                'count': 0
-            }
+            except Exception as e:
+                logger.debug(f"  ⚠️ AnyMailFinder error for {company_domain} (attempt {attempt+1}): {e}")
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                    continue
+                return not_found
+
+        return not_found
 
 
 class RapidAPIGoogleSearch:
@@ -145,22 +157,24 @@ class RapidAPIGoogleSearch:
         self.current_key_index = 0
         self.rate_limit_lock = Lock()
         self.last_call_time = 0
-        self.min_delay = 0.2  # 5 req/sec per key
+        self.min_delay = 0.1  # 10 req/sec per key
         logger.info(f"✓ RapidAPI Google Search initialized ({len(api_keys)} keys)")
 
     def _get_current_key(self) -> str:
-        """Rotate between API keys for higher throughput"""
-        key = self.api_keys[self.current_key_index]
-        self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
-        return key
+        """Rotate between API keys for higher throughput (thread-safe)"""
+        with self.rate_limit_lock:
+            key = self.api_keys[self.current_key_index]
+            self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
+            return key
 
     def _rate_limited_search(self, query: str, num_results: int = 10) -> Optional[Dict]:
-        """Thread-safe rate-limited Google search"""
+        """Thread-safe rate-limited Google search (reserve slot pattern)"""
         with self.rate_limit_lock:
             elapsed = time.time() - self.last_call_time
-            if elapsed < self.min_delay:
-                time.sleep(self.min_delay - elapsed)
-            self.last_call_time = time.time()
+            wait_time = max(0, self.min_delay - elapsed)
+            self.last_call_time = time.time() + wait_time  # Reserve slot
+        if wait_time > 0:
+            time.sleep(wait_time)
 
         for attempt in range(3):
             try:
@@ -331,16 +345,24 @@ class RapidAPIGoogleSearch:
 
         return True
 
-    def search_by_name(self, full_name: str, company_name: str, location: str = None) -> Dict:
+    def search_by_name(self, full_name: str, company_name: str, location: str = None, confidence: float = 1.0) -> Dict:
         """
         Search for person by name + company (extracted from email)
-        Max 3 attempts with different query strategies
+        Smart attempt strategy based on name confidence:
+        - High confidence (>=0.7): 3 attempts (full names like "John Smith")
+        - Low confidence (<0.7): 1 attempt (initials like "K Earle", single names)
+        Returns dict with 'attempt' field indicating which attempt succeeded.
         """
         result = {
             'full_name': full_name,
             'job_title': '',
-            'contact_linkedin': ''
+            'contact_linkedin': '',
+            'attempt': 0
         }
+
+        # Smart attempt count based on name confidence
+        # Low-confidence names (initials, single names) rarely match after attempt 1
+        max_attempts = 3 if confidence >= 0.7 else 1
 
         # 3-attempt strategy for >90% LinkedIn match rate
         search_attempts = [
@@ -352,10 +374,10 @@ class RapidAPIGoogleSearch:
 
             # Attempt 3: Broad - name + company without quotes (catches edge cases)
             (f'{full_name} {company_name} linkedin', 7)
-        ]
+        ][:max_attempts]
 
         for attempt_num, (query, num_results) in enumerate(search_attempts, 1):
-            logger.debug(f"  → Attempt {attempt_num}/3: Searching for {full_name} at {company_name}")
+            logger.debug(f"  → Attempt {attempt_num}/{max_attempts}: Searching for {full_name} at {company_name}")
 
             data = self._rate_limited_search(query, num_results=num_results)
 
@@ -367,9 +389,10 @@ class RapidAPIGoogleSearch:
                     require_linkedin=True
                 )
                 if found['full_name']:
+                    found['attempt'] = attempt_num
                     return found
 
-        logger.info(f"  ✗ No LinkedIn profile found for {full_name} after 3 attempts")
+        logger.info(f"  ✗ No LinkedIn profile found for {full_name} after {max_attempts} attempt(s)")
         return result
 
     def _extract_person_from_results(self, results: List[Dict], search_name: str, company_name: str,
@@ -624,8 +647,8 @@ class LinkedInJobScraper:
                     logger.info(f"✓ Scraper finished (Status: {status})\n")
                     break
 
-                # Poll interval (check for new items every 2 seconds)
-                time.sleep(2)
+                # Poll interval (check for new items every 1 second)
+                time.sleep(1)
 
             except Exception as e:
                 logger.error(f"❌ Error streaming jobs: {e}")
@@ -704,9 +727,9 @@ class LinkedInJobScraper:
                     return None
                 seen_names.add(name)
 
-            # 3c. Search LinkedIn (3-attempt strategy)
+            # 3c. Search LinkedIn (smart-attempt strategy based on name confidence)
             logger.info(f"  → Searching LinkedIn for {name}...")
-            contact = self.rapidapi_search.search_by_name(name, company_name)
+            contact = self.rapidapi_search.search_by_name(name, company_name, confidence=confidence)
 
             if not contact or not contact.get('job_title'):
                 logger.info(f"  ✗ LinkedIn not found")
@@ -738,36 +761,42 @@ class LinkedInJobScraper:
                 'dm_linkedin': contact.get('contact_linkedin', ''),
                 'dm_email': email,
                 'email_status': 'found',
-                'dm_source': 'RapidAPI Google Search by Name (Attempt 1)',
+                'dm_source': f'RapidAPI Google Search by Name (Attempt {contact.get("attempt", "?")})',
                 'dm_description': ''
             }
 
-        # Parallel processing (5 workers)
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        # Parallel processing (8 workers) with early-exit after 3 DMs
+        max_dms = 3
+        with ThreadPoolExecutor(max_workers=8) as executor:
             futures = [executor.submit(process_single_email, email) for email in emails]
             for future in as_completed(futures):
                 try:
                     result = future.result()
                     if result:
                         decision_makers.append(result)
+                        # Early-exit: stop processing once we have enough DMs
+                        if len(decision_makers) >= max_dms:
+                            for f in futures:
+                                f.cancel()
+                            logger.info(f"  ⚡ Early-exit: {max_dms} DMs found, skipping remaining emails")
+                            break
                 except Exception as e:
                     logger.error(f"  ❌ Error processing email: {e}")
 
-        # Step 4: Generate messages for all DMs
-        if self.openai_client:
-            for dm in decision_makers:
+        # Step 4: Generate messages for all DMs (parallel)
+        if self.openai_client and decision_makers:
+            def _generate_msg(dm):
                 try:
-                    msg = self.generate_message(
-                        dm['dm_name'],
-                        company_name,
-                        dm['job_title'],
-                        dm.get('dm_description', ''),
-                        dm.get('company_description', '')
+                    dm['message'] = self.generate_message(
+                        dm['dm_name'], company_name, dm['job_title'],
+                        dm.get('dm_description', ''), dm.get('company_description', '')
                     )
-                    dm['message'] = msg
                 except Exception as e:
                     logger.error(f"  ❌ Error generating message for {dm['dm_name']}: {e}")
                     dm['message'] = ""
+
+            with ThreadPoolExecutor(max_workers=3) as msg_executor:
+                list(msg_executor.map(_generate_msg, decision_makers))
         else:
             for dm in decision_makers:
                 dm['message'] = ""
@@ -901,44 +930,35 @@ class LinkedInJobScraper:
 
     def is_decision_maker(self, job_title: str) -> bool:
         """
-        Validate if job title is a decision-maker position
-        Migrated from Crunchbase scraper v4.0
-
-        Decision-maker keywords:
-        - founder, co-founder, ceo, chief executive
-        - owner, president, managing partner, managing director
-        - vice president, vp, cfo, cto, coo, cmo
-        - executive, c-suite, c-level, principal, partner
+        Validate if job title is a decision-maker position.
+        Uses regex word-boundary matching to prevent partial matches.
         """
         if not job_title or len(job_title) < 3:
             return False
 
         job_title_lower = job_title.lower()
 
-        decision_maker_keywords = [
-            # C-Suite & Founders
-            'founder', 'co-founder', 'ceo', 'chief executive', 'chief',
-            'owner', 'president', 'cfo', 'cto', 'coo', 'cmo',
-            'c-suite', 'c-level',
-            # Vice Presidents & Directors
-            'vice president', 'vp ', 'director', 'executive director', 'managing director',
-            # Heads & Partners
-            'head of', 'managing partner', 'partner', 'principal',
-            # Executive roles
-            'executive'
-        ]
+        # Regex word-boundary matching for decision-maker keywords
+        dm_pattern = r'\b(?:' + '|'.join([
+            r'founder', r'co-founder', r'ceo', r'chief executive', r'chief',
+            r'owner', r'president', r'cfo', r'cto', r'coo', r'cmo',
+            r'c-suite', r'c-level',
+            r'vice president', r'vp', r'svp', r'evp',
+            r'director', r'executive director', r'managing director',
+            r'head of', r'managing partner', r'partner', r'principal',
+            r'executive',
+        ]) + r')\b'
 
-        # Must contain at least one decision-maker keyword
-        has_dm_keyword = any(kw in job_title_lower for kw in decision_maker_keywords)
+        has_dm_keyword = bool(re.search(dm_pattern, job_title_lower))
 
         # Exclude non-decision-maker roles
-        exclude_keywords = [
-            'assistant', 'associate', 'junior', 'intern', 'coordinator',
-            'analyst', 'specialist', 'representative', 'agent', 'clerk',
-            'trainee', 'apprentice', 'student'
-        ]
+        exclude_pattern = r'\b(?:' + '|'.join([
+            r'assistant', r'associate', r'junior', r'intern', r'coordinator',
+            r'analyst', r'specialist', r'representative', r'agent', r'clerk',
+            r'trainee', r'apprentice', r'student',
+        ]) + r')\b'
 
-        has_exclude_keyword = any(kw in job_title_lower for kw in exclude_keywords)
+        has_exclude_keyword = bool(re.search(exclude_pattern, job_title_lower))
 
         return has_dm_keyword and not has_exclude_keyword
 
@@ -997,7 +1017,7 @@ class LinkedInJobScraper:
             if domain.startswith('www.'):
                 domain = domain[4:]
             return domain
-        except:
+        except Exception:
             return ""
 
     def validate_email_format(self, email: str) -> bool:
@@ -1362,12 +1382,13 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
             return
 
         processed_jobs = []
+        seen_emails = set()  # Cross-company email dedup
+        company_count = 0  # Track unique companies processed
 
         # Phase 2 & 3: TRUE STREAMING - Process as jobs arrive
         print(f"🔄 Streaming & Processing jobs in real-time...\n")
 
-        # Use 10 workers (aligned with 10 req/sec rate limit)
-        # Math: 10 workers × 2 API calls/company × 100ms delay = 10 req/sec
+        # Use 10 outer workers (I/O bound - mostly waiting on API calls)
         with ThreadPoolExecutor(max_workers=10) as executor:
             futures = {}  # Track in-flight futures only
             stream_complete = False
@@ -1393,14 +1414,21 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
                         job_info = futures[future]
                         try:
                             results = future.result()  # Now returns List[Dict]
-                            processed_jobs.extend(results)  # Flatten list of DMs
+                            company_count += 1
+
+                            # Dedup emails across companies
+                            for dm in results:
+                                email = dm.get('dm_email', '')
+                                if email and email not in seen_emails:
+                                    seen_emails.add(email)
+                                    processed_jobs.append(dm)
 
                             # Real-time feedback
                             if results:
                                 email_status = f"{len(results)} DMs"
-                                print(f"   ✓ [{len(processed_jobs)}] {job_info['company_name']} ({email_status})")
+                                print(f"   ✓ [{company_count}] {job_info['company_name']} ({email_status})")
                             else:
-                                print(f"   ✗ [{len(processed_jobs)}] {job_info['company_name']} (0 DMs)")
+                                print(f"   ✗ [{company_count}] {job_info['company_name']} (0 DMs)")
                         except Exception as e:
                             logger.error(f"❌ Error processing {job_info['company_name']}: {e}")
                         finally:
@@ -1418,9 +1446,10 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
 
         print("\n" + "-" * 70)
         print(f"📊 SUMMARY:")
-        print(f"   Processed: {len(processed_jobs)} unique companies")
-        print(f"   Emails Found: {len(jobs_with_emails)}")
-        print(f"   Success Rate: {len(jobs_with_emails)/len(processed_jobs)*100:.1f}%" if processed_jobs else "   Success Rate: 0%")
+        print(f"   Companies Processed: {company_count}")
+        print(f"   Decision Makers Found: {len(processed_jobs)}")
+        print(f"   Emails Exported: {len(jobs_with_emails)}")
+        print(f"   Avg DMs/Company: {len(processed_jobs)/company_count:.1f}" if company_count else "   Avg DMs/Company: 0")
         print("-" * 70 + "\n")
 
         # Save CSV backup
@@ -1446,7 +1475,6 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
 
 def main():
     """CLI entry point with argparse."""
-    import argparse
 
     parser = argparse.ArgumentParser(
         description='LinkedIn Job Scraper with Decision Maker Outreach (Bebity Pattern)',

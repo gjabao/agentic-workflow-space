@@ -25,7 +25,6 @@ import json
 import logging
 import time
 import re
-import random
 import requests
 import pandas as pd
 from typing import Dict, List, Optional, Tuple
@@ -37,7 +36,6 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
-from openai import AzureOpenAI
 from utils_notifications import notify_success, notify_error
 
 load_dotenv()
@@ -143,24 +141,34 @@ class RapidAPIGoogleSearch:
     def __init__(self, api_keys: List[str]):
         self.api_keys = api_keys
         self.current_key_index = 0
+        self.key_lock = Lock()  # Thread-safe key rotation
         self.rate_limit_lock = Lock()
         self.last_call_time = 0
         self.min_delay = 0.1  # 10 req/sec per key (OPTIMIZED)
         logger.info(f"✓ RapidAPI Google Search initialized ({len(api_keys)} keys)")
 
     def _get_current_key(self) -> str:
-        """Rotate between API keys for higher throughput"""
-        key = self.api_keys[self.current_key_index]
-        self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
-        return key
+        """Rotate between API keys for higher throughput (thread-safe)"""
+        with self.key_lock:
+            key = self.api_keys[self.current_key_index]
+            self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
+            return key
 
     def _rate_limited_search(self, query: str, num_results: int = 10) -> Optional[Dict]:
         """Thread-safe rate-limited Google search"""
+        # Calculate wait time inside lock, sleep outside to avoid blocking other threads
+        wait_time = 0
         with self.rate_limit_lock:
             elapsed = time.time() - self.last_call_time
             if elapsed < self.min_delay:
-                time.sleep(self.min_delay - elapsed)
-            self.last_call_time = time.time()
+                wait_time = self.min_delay - elapsed
+            else:
+                self.last_call_time = time.time()
+
+        if wait_time > 0:
+            time.sleep(wait_time)
+            with self.rate_limit_lock:
+                self.last_call_time = time.time()
 
         for attempt in range(3):
             try:
@@ -298,10 +306,7 @@ class RapidAPIGoogleSearch:
                 # Validate: must be 3-100 chars, no URLs
                 if 3 <= len(title_text) <= 100:
                     if not re.search(r'(http|www\.|\.com|linkedin)', title_text, re.IGNORECASE):
-                        # CRITICAL: Filter out company names (appears at end of pattern)
-                        # If title matches company name pattern, skip it
-                        if not self._is_company_match(title_text, "", threshold=0.8):
-                            return title_text.strip()
+                        return title_text.strip()
 
         return ""
 
@@ -370,7 +375,7 @@ class RapidAPIGoogleSearch:
         ]
 
         for attempt_num, (query, num_results) in enumerate(search_attempts, 1):
-            logger.debug(f"  → LinkedIn query {attempt_num}/3: {query}")
+            logger.debug(f"  → LinkedIn query {attempt_num}/2: {query}")
 
             data = self._rate_limited_search(query, num_results=num_results)
 
@@ -447,26 +452,22 @@ class LeadEnricher:
         if not anymail_key:
             raise ValueError("❌ ANYMAILFINDER_API_KEY not found in .env file")
 
-        self.azure_key = os.getenv("AZURE_OPENAI_API_KEY")
-        self.azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-        self.azure_deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
-
         # 2. Initialize clients (email-first approach)
         self.email_enricher = AnyMailFinder(anymail_key)
         self.search_client = RapidAPIGoogleSearch(rapidapi_keys)
 
-        # 3. Azure OpenAI
-        if self.azure_key and self.azure_endpoint:
-            self.openai_client = AzureOpenAI(
-                api_key=self.azure_key,
-                api_version="2024-02-15-preview",
-                azure_endpoint=self.azure_endpoint
-            )
-        else:
-            self.openai_client = None
-            logger.warning("⚠️ Azure OpenAI keys missing. Personalization will be skipped.")
+        # 3. Cached Google services (avoid re-creating on every API call)
+        self._sheets_service = None
+        self._drive_service = None
 
         logger.info("✓ LeadEnricher v2.0 (Email-First) initialized")
+
+    def _get_sheets_service(self):
+        """Get cached Google Sheets service (avoids re-creating on every call)."""
+        if not self._sheets_service:
+            creds = self.get_credentials()
+            self._sheets_service = build('sheets', 'v4', credentials=creds)
+        return self._sheets_service
 
     def _extract_domain_from_website(self, website: str) -> Optional[str]:
         """Extract clean domain from website URL"""
@@ -619,17 +620,6 @@ class LeadEnricher:
 
         has_exclude_keyword = any(kw in job_title_lower for kw in exclude_keywords)
 
-        # CRITICAL FIX: Exclude if job title is ONLY a company name (no actual title)
-        # Examples to reject: "Ava Labs", "Wave", "Unstoppable Domains"
-        # This happens when LinkedIn title extraction fails and returns company name instead
-        if not has_dm_keyword:
-            return False
-
-        # If title is too short (1-2 words) and has no DM keywords, likely a company name
-        words = job_title.split()
-        if len(words) <= 2 and not has_dm_keyword:
-            return False
-
         return has_dm_keyword and not has_exclude_keyword
 
     def _find_company_website(self, company_name: str, description: str = "") -> Optional[str]:
@@ -779,8 +769,7 @@ class LeadEnricher:
 
     def read_sheet(self, sheet_id: str, range_name: str = "A:Z") -> tuple:
         """Read data and get first sheet ID."""
-        creds = self.get_credentials()
-        service = build('sheets', 'v4', credentials=creds)
+        service = self._get_sheets_service()
         
         # Get spreadsheet metadata to find the real sheetId
         meta = service.spreadsheets().get(spreadsheetId=sheet_id).execute()
@@ -809,8 +798,7 @@ class LeadEnricher:
 
     def update_sheet_row(self, sheet_id: str, grid_id: int, row_index: int, updates: Dict[str, str], headers: List[str]):
         """Update specific columns for a row."""
-        creds = self.get_credentials()
-        service = build('sheets', 'v4', credentials=creds)
+        service = self._get_sheets_service()
         
         # Calculate column letters based on headers
         # This is a simple implementation assuming standard columns A-Z...
@@ -852,8 +840,7 @@ class LeadEnricher:
 
     def insert_new_rows(self, sheet_id: str, grid_id: int, after_row_index: int, num_rows: int):
         """Insert new blank rows after a specific row index."""
-        creds = self.get_credentials()
-        service = build('sheets', 'v4', credentials=creds)
+        service = self._get_sheets_service()
 
         requests = [{
             "insertDimension": {
@@ -872,8 +859,7 @@ class LeadEnricher:
 
     def duplicate_row_data(self, sheet_id: str, grid_id: int, target_rows: List[int], headers: List[str], original_data: Dict):
         """Duplicate all original company data to new rows."""
-        creds = self.get_credentials()
-        service = build('sheets', 'v4', credentials=creds)
+        service = self._get_sheets_service()
 
         requests = []
 
@@ -1036,134 +1022,7 @@ class LeadEnricher:
         # Ensure we return max 4 DMs
         return decision_makers[:4]
 
-    def generate_personalization(self, company: str, dm_data: Dict, website_desc: str) -> str:
-        """Generate personalized message using rotated prompts."""
-        if not self.openai_client:
-            return ""
-
-        prompts = [
-            # 1. Company-Based
-            {
-                "name": "Company-Based",
-                "template": """
-                Dream Output: Noticed Summit Capital helps CEOs and CFOs at mid-market manufacturing companies — I know a few who can't find buyers when they're ready to exit and waste months with investment bankers who don't understand their industry.
-                Worth intro'eing you?
-                
-                Format:
-                Noticed [clean_company_name] helps [job_titles] at [company_type] — I know a few who [pain_description].
-                Worth intro'ing you?
-                
-                Rules:
-                - [clean_company_name] = company name WITHOUT LLC/Inc.
-                - [job_titles] = real titles (CFOs, store managers)
-                - [company_type] = specific type (mid-sized law firms)
-                - [pain_description] = how they complain (waste hours, lose money)
-                - NO corporate speak (solutions, leverage, optimize)
-                - ONE sentence + CTA
-                """
-            },
-            # 2. Market Conversations
-            {
-                "name": "Market Conversations",
-                "template": """
-                Dream Output: Figured I’d reach out — I talk to a lot of CEOs in mid-market manufacturing and they keep saying they can’t find buyers who actually understand their space.
-                Thought you two should connect.
-                
-                Format:
-                Figured I’d reach out — I talk to a lot of [dreamICP] and they keep saying they [painTheySolve].
-                Thought you two should connect.
-                
-                Rules:
-                - [dreamICP] = plural group (founders in logistics)
-                - [painTheySolve] = operator complaint (can't keep up, waste hours)
-                - NO corporate speak
-                """
-            },
-            # 3. I'm Around Them Daily
-            {
-                "name": "Around Them Daily",
-                "template": """
-                Dream Output: Figured I’d reach out — I’m around founders in logistics daily and they keep saying they can’t find staffing partners who actually move fast.
-                
-                Format:
-                Figured I’d reach out — I’m around [dreamICP] daily and they keep saying they [painTheySolve].
-                
-                Rules:
-                - [dreamICP] = plural group
-                - [painTheySolve] = natural complaint
-                - One sentence only
-                """
-            },
-            # 4. Deal-Flow
-            {
-                "name": "Deal-Flow",
-                "template": """
-                Dream Output: 
-                Saw some movement on my side --
-                Figured I’d reach out — I’m around founders in logistics daily and they keep saying they can’t find reliable partners who move fast.
-                Can plug you into the deal flow if you want.
-                
-                Format:
-                Saw some movement on my side —
-                Figured I’d reach out — I’m around [dreamICP] daily and they keep saying they [painTheySolve].
-                Can plug you into the deal flow if you want.
-                
-                Rules:
-                - exact 3 lines
-                - [dreamICP] = plural group
-                - [painTheySolve] = real complaint
-                """
-            },
-            # 5. Ultra-Operator
-            {
-                "name": "Ultra-Operator",
-                "template": """
-                Dream Output:
-                Figured I’d reach out — I’m around founders in logistics daily and they keep saying they can’t find staffing partners who actually move quickly.
-                Can plug you into the deal flow if you want.
-                
-                Format:
-                Figured I’d reach out — I’m around [dreamICP] daily and they keep saying they [painTheySolve].
-                Can plug you into the deal flow if you want.
-                
-                Rules:
-                - exact lines
-                - [dreamICP] = plural group
-                - [painTheySolve] = natural complaint
-                """
-            }
-        ]
-        
-        selected_prompt = random.choice(prompts)
-        
-        system_prompt = f"""
-        You are a master networker/connector using the "{selected_prompt['name']}" frame.
-        Context:
-        - Company: {company}
-        - DM Description: {dm_data.get('description', '')}
-        - Website Context: {website_desc}
-        
-        TASK: Write ONLY the output following the format below exactly.
-        
-        {selected_prompt['template']}
-        """
-
-        try:
-            response = self.openai_client.chat.completions.create(
-                model=self.azure_deployment,
-                messages=[
-                    {"role": "system", "content": "You are a Spartan copywriter. No fluff. No jargon."},
-                    {"role": "user", "content": system_prompt}
-                ],
-                temperature=0.7,
-                max_tokens=150
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            logger.error(f"Error generating message: {e}")
-            return ""
-
-    def process_row(self, row: Dict, row_index: int, sheet_id: str, grid_id: int, headers: List[str], col_map: Dict, company: str, website: str, dry_run: bool = False) -> int:
+    def process_row(self, row: Dict, row_index: int, sheet_id: str, grid_id: int, headers: List[str], company: str, website: str, dry_run: bool = False) -> int:
         """
         Process a single row using email-first workflow.
         Updates ALL decision-makers by duplicating rows for additional DMs.
@@ -1248,8 +1107,7 @@ class LeadEnricher:
 
         logger.info(f"  → Adding {len(missing_cols)} missing columns: {missing_cols}")
 
-        creds = self.get_credentials()
-        service = build('sheets', 'v4', credentials=creds)
+        service = self._get_sheets_service()
 
         # Append new columns to the right of existing data
         new_col_index = len(headers)
@@ -1358,7 +1216,7 @@ class LeadEnricher:
 
             # Process row and get number of DMs added
             logger.info(f"✓ PROCESSING: Row {current_row_index+1} - {company}")
-            num_dms = self.process_row(row, current_row_index, sheet_id, grid_id, headers, {}, company, website, dry_run)
+            num_dms = self.process_row(row, current_row_index, sheet_id, grid_id, headers, company, website, dry_run)
 
             if num_dms > 0:
                 processed += 1
@@ -1386,7 +1244,10 @@ class LeadEnricher:
         else:
             print(f"   (Dry run - no actual updates made)")
 
-        notify_success()
+        if total_dms > 0:
+            notify_success()
+        else:
+            notify_error()
 
 if __name__ == "__main__":
     import argparse

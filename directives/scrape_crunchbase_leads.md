@@ -26,23 +26,36 @@ python execution/scrape_crunchbase.py \
 
 ## Expected Output
 
-**Format:** Google Sheets or CSV (13 columns)
+**Format:** Google Sheets or CSV (26 columns - v4.2)
 
 | Column | Example | Source |
 |--------|---------|--------|
-| company_name | Phantom | Crunchbase |
-| first_name | Brandon | Email extraction |
-| last_name | Millman | Email extraction |
-| job_title | CEO & Co | LinkedIn |
-| email | brandon@phantom.com | AnyMailFinder |
-| linkedin_url | linkedin.com/in/... | RapidAPI |
-| website | phantom.com | Crunchbase/Search |
-| location | San Francisco, CA | Crunchbase |
+| company_name | RedotPay | Crunchbase |
+| first_name | Michael | Email extraction |
+| last_name | Chin | Email extraction |
+| job_title | Director | LinkedIn |
+| email | michaelchin@redotpay.com | AnyMailFinder |
+| linkedin_url | (LinkedIn profile URL) | RapidAPI |
+| website | redotpay.com | Crunchbase |
+| location | Central | Crunchbase |
+| phone_number | +1-555-0100 | Crunchbase |
+| company_email | (company contact email) | Crunchbase |
+| company_linkedin | (company LinkedIn URL) | Crunchbase |
+| company_facebook | facebook.com/... | Crunchbase |
+| founded_on | 2023-01-01 | Crunchbase |
+| operating_status | active | Crunchbase |
+| company_type | for_profit | Crunchbase |
+| num_contacts | 15 | Crunchbase |
+| rank_org_company | 856 | Crunchbase |
+| heat_score_tier | c100_high | Crunchbase |
+| growth_score_tier | c100_high | Crunchbase |
 | funding_stage | Series B | Crunchbase (formatted) |
-| total_funding | $109M | Crunchbase (formatted) |
-| last_funding_date | 2022-01-18 | Crunchbase |
+| total_funding | $194.0M | Crunchbase (formatted) |
+| last_funding_date | 2025-12-16 | Crunchbase |
+| last_funding_total | $107.0M | Crunchbase (formatted) |
+| last_equity_funding | $107.0M | Crunchbase (formatted) |
 | description | Digital wallet... | Crunchbase |
-| categories | Cryptocurrency, FinTech | Crunchbase (formatted) |
+| categories | Blockchain, FinTech | Crunchbase (formatted) |
 
 **Quality metrics:**
 - **Coverage:** 200-300% (2-3 decision-makers per company)
@@ -50,15 +63,15 @@ python execution/scrape_crunchbase.py \
 - **LinkedIn accuracy:** 90%+ (verified profiles only)
 - **Processing:** ~1 minute per company
 
-## Workflow (Email-First - v4.0)
+## Workflow (Email-First - v4.2)
 
 1. **Scrape companies** from Crunchbase (Apify actor)
-2. **Find website** (from Crunchbase or Google Search with 3-attempt strategy)
+2. **Get website** directly from Crunchbase (no search needed - v4.2)
 3. **Find ALL emails** at company (up to 20) - AnyMailFinder Company API
 4. **Extract names** from emails (firstname.lastname@ → "Firstname Lastname")
 5. **Search LinkedIn** by name + company (RapidAPI - 3 attempts per person)
 6. **Validate decision-maker** (CEO, CFO, VP, Founder, etc.)
-7. **Output** only decision-makers with verified emails
+7. **Output** only decision-makers with verified emails + all company data
 
 **LinkedIn Search Strategy (3 attempts):**
 
@@ -113,6 +126,18 @@ python execution/scrape_crunchbase.py \
 - Low LinkedIn (<85%) → Normal for small startups (<10 employees)
 
 ## Self-Annealing Notes
+
+**v4.2 (2026-02-14) - Direct Website + Expanded Output:**
+
+- **Removed:** Website search via RapidAPI Google Search (no longer needed)
+- **Reason:** Crunchbase Table Mode already includes website column
+- **Performance gain:** ~30% faster (skips 3-attempt website search per company)
+- **Expanded output:** 26 columns (was 13)
+  - Added: phone_number, company_email, company_linkedin, company_facebook
+  - Added: founded_on, operating_status, company_type, num_contacts
+  - Added: rank_org_company, heat_score_tier, growth_score_tier
+  - Added: last_funding_total, last_equity_funding
+- **Fix:** Crunchbase API v4.1+ returns dicts for fields (handled via `_safe_get_string()`)
 
 **v4.1 (2026-01-16) - Parallel Email Processing:**
 

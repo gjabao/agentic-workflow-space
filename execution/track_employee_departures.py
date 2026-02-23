@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Employee Departure Tracker v1.0 - Find Decision Makers at Previous Companies
+Employee Departure Tracker v1.1 - Find Decision Makers at Previous Companies
 
 WORKFLOW:
 1. Read Google Sheet with LinkedIn profile URLs (people who changed jobs)
@@ -15,11 +15,13 @@ Directive: directives/track_employee_departures.md
 
 import os
 import sys
+import csv
 import json
 import time
 import re
 import argparse
 import logging
+import threading
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -57,65 +59,90 @@ SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapi
 class AnyMailFinder:
     """
     Company Email Finder - Returns ALL emails at a company (up to 20)
-    Copied from scrape_crunchbase.py
+    Thread-safe with rate limiting and retry logic.
     """
 
     BASE_URL = "https://api.anymailfinder.com/v5.1/find-email/company"
 
     def __init__(self, api_key: str):
-        self.api_key = api_key
+        self._auth_header = api_key  # Stored minimally for request auth
+        self._rate_limit_lock = Lock()
+        self._last_call_time = 0
+        self._min_delay = 0.2  # 5 req/sec max
         logger.info("✓ AnyMailFinder (Company Email API) initialized")
+
+    def __repr__(self):
+        return "<AnyMailFinder initialized>"
 
     def find_company_emails(self, company_domain: str, company_name: str = None) -> Dict:
         """
         Find ALL emails at a company in ONE call.
-        Returns up to 20 emails per company!
+        Returns up to 20 emails per company.
+        Thread-safe with rate limiting and retry on 429.
         """
-        try:
-            headers = {
-                'Authorization': self.api_key,
-                'Content-Type': 'application/json'
-            }
+        # Rate limiting
+        with self._rate_limit_lock:
+            elapsed = time.time() - self._last_call_time
+            if elapsed < self._min_delay:
+                time.sleep(self._min_delay - elapsed)
+            self._last_call_time = time.time()
 
-            payload = {
-                'domain': company_domain,
-                'email_type': 'any'
-            }
+        for attempt in range(3):
+            try:
+                headers = {
+                    'Authorization': self._auth_header,
+                    'Content-Type': 'application/json'
+                }
 
-            if company_name:
-                payload['company_name'] = company_name
+                payload = {
+                    'domain': company_domain,
+                    'email_type': 'any'
+                }
 
-            response = requests.post(
-                self.BASE_URL,
-                headers=headers,
-                json=payload,
-                timeout=15
-            )
+                if company_name:
+                    payload['company_name'] = company_name
 
-            if response.status_code == 200:
-                data = response.json()
-                email_status = data.get('email_status', 'not_found')
+                response = requests.post(
+                    self.BASE_URL,
+                    headers=headers,
+                    json=payload,
+                    timeout=15
+                )
 
-                if email_status == 'valid' and data.get('valid_emails'):
-                    return {
-                        'emails': data['valid_emails'],
-                        'status': 'found',
-                        'count': len(data['valid_emails'])
-                    }
+                if response.status_code == 200:
+                    data = response.json()
+                    email_status = data.get('email_status', 'not_found')
+
+                    if email_status == 'valid' and data.get('valid_emails'):
+                        return {
+                            'emails': data['valid_emails'],
+                            'status': 'found',
+                            'count': len(data['valid_emails'])
+                        }
+                    else:
+                        return {'emails': [], 'status': 'not-found', 'count': 0}
+                elif response.status_code == 429:
+                    wait_time = 2 ** attempt
+                    logger.debug(f"AnyMailFinder 429 for {company_domain}, retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
                 else:
                     return {'emails': [], 'status': 'not-found', 'count': 0}
-            else:
+
+            except Exception as e:
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                    continue
+                logger.debug(f"Error for {company_domain}: {e}")
                 return {'emails': [], 'status': 'not-found', 'count': 0}
 
-        except Exception as e:
-            logger.debug(f"Error for {company_domain}: {e}")
-            return {'emails': [], 'status': 'not-found', 'count': 0}
+        return {'emails': [], 'status': 'not-found', 'count': 0}
 
 
 class RapidAPIGoogleSearch:
     """
     RapidAPI Google Search - For LinkedIn profile enrichment
-    Copied from scrape_crunchbase.py
+    Thread-safe key rotation and rate limiting.
     """
 
     def __init__(self, api_keys: List[str]):
@@ -123,12 +150,17 @@ class RapidAPIGoogleSearch:
         self.current_key_index = 0
         self.rate_limit_lock = Lock()
         self.last_call_time = 0
-        self.min_delay = 0.2  # 5 req/sec per key
+        self.min_delay = 0.1  # 10 req/sec per key (faster with 2 keys)
         logger.info(f"✓ RapidAPI Google Search initialized ({len(api_keys)} keys)")
 
+    def __repr__(self):
+        return f"<RapidAPIGoogleSearch keys={len(self.api_keys)}>"
+
     def _get_current_key(self) -> str:
-        key = self.api_keys[self.current_key_index]
-        self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
+        """Thread-safe key rotation"""
+        with self.rate_limit_lock:
+            key = self.api_keys[self.current_key_index]
+            self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
         return key
 
     def _rate_limited_search(self, query: str, num_results: int = 10) -> Optional[Dict]:
@@ -261,11 +293,11 @@ class EmployeeDepartureTracker:
     """
 
     def __init__(self):
-        logger.info("⏳ Initializing EmployeeDepartureTracker v1.0...")
+        logger.info("⏳ Initializing EmployeeDepartureTracker v1.1...")
 
-        # Load API keys
-        self.apify_api_key = self._load_secret("APIFY_API_KEY", required=True)
-        self.anymailfinder_api_key = self._load_secret("ANYMAILFINDER_API_KEY", required=True)
+        # Load API keys (Load → Use → Delete pattern)
+        apify_key = self._load_secret("APIFY_API_KEY", required=True)
+        amf_key = self._load_secret("ANYMAILFINDER_API_KEY", required=True)
 
         rapidapi_keys = [
             os.getenv("RAPIDAPI_KEY"),
@@ -275,12 +307,23 @@ class EmployeeDepartureTracker:
         if not rapidapi_keys:
             raise ValueError("❌ RAPIDAPI_KEY not found in .env file")
 
-        # Initialize clients
-        self.apify_client = ApifyClient(self.apify_api_key)
-        self.email_enricher = AnyMailFinder(self.anymailfinder_api_key)
+        # Initialize clients (keys passed directly, not stored on self)
+        self.apify_client = ApifyClient(apify_key)
+        self.email_enricher = AnyMailFinder(amf_key)
         self.search_client = RapidAPIGoogleSearch(rapidapi_keys)
 
-        logger.info("✓ EmployeeDepartureTracker v1.0 initialized")
+        # Delete local key references
+        del apify_key
+        del amf_key
+        del rapidapi_keys
+
+        # Global semaphore to cap total concurrent API calls across nested executors
+        self._api_semaphore = threading.Semaphore(15)
+
+        logger.info("✓ EmployeeDepartureTracker v1.1 initialized")
+
+    def __repr__(self):
+        return "<EmployeeDepartureTracker v1.1>"
 
     def _load_secret(self, key_name: str, required: bool = False) -> Optional[str]:
         value = os.getenv(key_name)
@@ -556,6 +599,14 @@ class EmployeeDepartureTracker:
             'location': most_recent['location']
         }
 
+    @staticmethod
+    def _validate_email(email: str) -> bool:
+        """Validate email format (RFC 5322 simplified)"""
+        if not email or '@' not in email:
+            return False
+        pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        return bool(re.match(pattern, email))
+
     def _find_company_website(self, company_name: str) -> Optional[str]:
         """Find company website via Google Search (3 attempts) with strict filtering"""
 
@@ -584,7 +635,7 @@ class EmployeeDepartureTracker:
         search_attempts = [
             (f'"{company_name}" official website', 7),
             (f'{company_name} company homepage', 7),
-            (f'{company_name} about us', 7)
+            (f'{company_name} website', 10)
         ]
 
         for attempt_num, (query, num_results) in enumerate(search_attempts, 1):
@@ -707,11 +758,30 @@ class EmployeeDepartureTracker:
 
         return has_dm and not has_exclude
 
+    def _build_departure_row(self, departure_info: Dict, domain: str = '',
+                              full_name: str = '', job_title: str = '',
+                              email: str = '', linkedin_url: str = '') -> Dict:
+        """Build a single output row for a decision-maker (or empty DM placeholder)"""
+        return {
+            'departed_first_name': departure_info.get('first_name', ''),
+            'departed_last_name': departure_info.get('last_name', ''),
+            'departed_linkedin': departure_info['person_linkedin'],
+            'role_they_left': departure_info['role_they_left'],
+            'previous_company': departure_info['previous_company'],
+            'left_date': departure_info['left_date'],
+            'dm_first_name': full_name.split()[0] if full_name else '',
+            'dm_last_name': ' '.join(full_name.split()[1:]) if len(full_name.split()) > 1 else '',
+            'dm_job_title': self._normalize_job_title(job_title),
+            'dm_email': email,
+            'dm_linkedin_url': linkedin_url,
+            'company_website': domain
+        }
+
     def enrich_previous_company(self, departure_info: Dict) -> List[Dict]:
         """
-        Find decision makers at the previous company
-
-        Returns list of decision makers with emails
+        Find decision makers at the previous company.
+        Returns list of decision makers with emails.
+        If no DMs found, returns a placeholder row per directive.
         """
         company_name = departure_info['previous_company']
         logger.info(f"\n{'='*70}")
@@ -721,8 +791,8 @@ class EmployeeDepartureTracker:
         # Find website
         domain = self._find_company_website(company_name)
         if not domain:
-            logger.info(f"   ⊘ No website found - skipping")
-            return []
+            logger.info(f"   ⊘ No website found - including placeholder row")
+            return [self._build_departure_row(departure_info)]
 
         # Find emails
         logger.info(f"   📧 Finding emails at {domain}...")
@@ -731,70 +801,83 @@ class EmployeeDepartureTracker:
         logger.info(f"   ✓ Found {len(emails)} emails")
 
         if not emails:
-            return []
+            logger.info(f"   ⊘ No emails found - including placeholder row")
+            return [self._build_departure_row(departure_info, domain=domain)]
 
         # Process emails to find decision makers
         decision_makers = []
         seen_names = set()
         seen_names_lock = Lock()
 
-        def process_email(email: str) -> Optional[Dict]:
-            logger.info(f"   🔍 Processing: {email}")
+        def process_email(email_addr: str) -> Optional[Dict]:
+            # Global semaphore to cap total concurrent API calls
+            with self._api_semaphore:
+                logger.info(f"   🔍 Processing: {email_addr}")
 
-            extracted_name, is_generic, confidence = self.extract_contact_from_email(email)
-
-            if is_generic or not extracted_name or confidence < 0.5:
-                return None
-
-            logger.info(f"      → Name: {extracted_name} (conf: {confidence:.0%})")
-
-            # Search LinkedIn
-            contact_info = self.search_client.search_by_name(extracted_name, company_name)
-
-            full_name = contact_info.get('full_name', extracted_name)
-            job_title = contact_info.get('job_title', '')
-            linkedin_url = contact_info.get('contact_linkedin', '')
-
-            # Deduplicate
-            with seen_names_lock:
-                if full_name.lower() in seen_names:
+                # Validate email format
+                if not self._validate_email(email_addr):
+                    logger.info(f"      ✗ Invalid email format: {email_addr}")
                     return None
-                seen_names.add(full_name.lower())
 
-            # Validate decision maker
-            if not self.is_decision_maker(job_title):
-                logger.info(f"      ✗ Not a decision-maker: {job_title}")
-                return None
+                extracted_name, is_generic, confidence = self.extract_contact_from_email(email_addr)
 
-            dm = {
-                'departed_first_name': departure_info.get('first_name', ''),
-                'departed_last_name': departure_info.get('last_name', ''),
-                'departed_linkedin': departure_info['person_linkedin'],
-                'role_they_left': departure_info['role_they_left'],
-                'previous_company': company_name,
-                'left_date': departure_info['left_date'],
-                'dm_first_name': full_name.split()[0] if full_name else '',
-                'dm_last_name': ' '.join(full_name.split()[1:]) if len(full_name.split()) > 1 else '',
-                'dm_job_title': self._normalize_job_title(job_title),
-                'dm_email': email,
-                'dm_linkedin_url': linkedin_url,
-                'company_website': domain
-            }
+                if is_generic or not extracted_name or confidence < 0.5:
+                    return None
 
-            logger.info(f"      ★ Decision-maker: {full_name} ({job_title})")
-            return dm
+                logger.info(f"      → Name: {extracted_name} (conf: {confidence:.0%})")
 
-        # Parallel processing
+                # Search LinkedIn
+                contact_info = self.search_client.search_by_name(extracted_name, company_name)
+
+                full_name = contact_info.get('full_name', extracted_name)
+                job_title = contact_info.get('job_title', '')
+                linkedin_url = contact_info.get('contact_linkedin', '')
+
+                # Deduplicate
+                with seen_names_lock:
+                    if full_name.lower() in seen_names:
+                        return None
+                    seen_names.add(full_name.lower())
+
+                # Validate decision maker
+                if not self.is_decision_maker(job_title):
+                    logger.info(f"      ✗ Not a decision-maker: {job_title}")
+                    return None
+
+                dm = self._build_departure_row(
+                    departure_info, domain=domain,
+                    full_name=full_name, job_title=job_title,
+                    email=email_addr, linkedin_url=linkedin_url
+                )
+
+                logger.info(f"      ★ Decision-maker: {full_name} ({job_title})")
+                return dm
+
+        # Parallel processing with early termination (stop after 5 DMs)
+        # 5 workers per directive (not 10)
+        MAX_DMS_PER_COMPANY = 5
+
         with ThreadPoolExecutor(max_workers=5) as executor:
             futures = {executor.submit(process_email, email): email for email in emails[:20]}
 
             for future in as_completed(futures):
+                # Early termination - stop if we have enough DMs
+                if len(decision_makers) >= MAX_DMS_PER_COMPANY:
+                    for f in futures:
+                        f.cancel()
+                    break
+
                 try:
                     result = future.result()
                     if result:
                         decision_makers.append(result)
                 except Exception as e:
                     logger.error(f"      ❌ Error: {e}")
+
+        # If no decision-makers found, include placeholder row for manual research (per directive)
+        if not decision_makers:
+            logger.info(f"   ⊘ No decision-makers found - including placeholder row for manual research")
+            return [self._build_departure_row(departure_info, domain=domain)]
 
         logger.info(f"   ✓ Found {len(decision_makers)} decision-makers at {company_name}")
         return decision_makers
@@ -866,7 +949,6 @@ class EmployeeDepartureTracker:
 
     def export_to_csv(self, leads: List[Dict], filename: Optional[str] = None) -> str:
         """Export leads to CSV"""
-        import csv
 
         if filename is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -891,12 +973,12 @@ class EmployeeDepartureTracker:
         2. Scrape profiles
         3. Extract previous companies
         4. Find decision makers
-        5. Export results
+        5. Deduplicate & export results
         """
         start_time = time.time()
 
         logger.info("=" * 70)
-        logger.info("EMPLOYEE DEPARTURE TRACKER v1.0")
+        logger.info("EMPLOYEE DEPARTURE TRACKER v1.1")
         logger.info("=" * 70)
         logger.info(f"Input Sheet: {sheet_url[:80]}...")
         logger.info(f"Limit: {limit} profiles")
@@ -933,17 +1015,50 @@ class EmployeeDepartureTracker:
             logger.warning("⚠️ No recent departures found (all jobs older than 6 months?)")
             return ""
 
-        # Step 4: Enrich with decision makers
+        # Step 4: Enrich with decision makers (PARALLEL - 10 companies at a time)
         all_leads = []
+        completed = 0
+        total = len(departures)
+        leads_lock = Lock()
 
-        for departure in departures:
-            leads = self.enrich_previous_company(departure)
-            all_leads.extend(leads)
+        def process_departure(departure):
+            return self.enrich_previous_company(departure)
 
-        logger.info(f"\n✓ Total decision-makers found: {len(all_leads)}")
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(process_departure, dep): dep for dep in departures}
+
+            for future in as_completed(futures):
+                try:
+                    leads = future.result()
+                    with leads_lock:
+                        all_leads.extend(leads)
+                        completed += 1
+                        # Progress: every item when <10 total, else every 10%
+                        if total < 10 or completed % max(1, total // 10) == 0 or completed == total:
+                            logger.info(f"⏳ Company progress: {completed}/{total} ({100*completed//total}%)")
+                except Exception as e:
+                    logger.error(f"❌ Error processing departure: {e}")
+
+        # Step 4b: Global deduplication by dm_email across all companies
+        raw_count = len(all_leads)
+        seen_emails = set()
+        deduped_leads = []
+        for lead in all_leads:
+            email = lead.get('dm_email', '').lower()
+            if email and email in seen_emails:
+                continue  # Skip duplicate
+            if email:
+                seen_emails.add(email)
+            deduped_leads.append(lead)
+
+        all_leads = deduped_leads
+        if raw_count != len(all_leads):
+            logger.info(f"✓ Deduplication: {raw_count} → {len(all_leads)} (removed {raw_count - len(all_leads)} duplicates)")
+
+        logger.info(f"\n✓ Total leads (incl. placeholders): {len(all_leads)}")
 
         if not all_leads:
-            logger.warning("⚠️ No decision-makers found")
+            logger.warning("⚠️ No leads found")
             return ""
 
         # Step 5: Export
@@ -963,7 +1078,7 @@ class EmployeeDepartureTracker:
         logger.info("=" * 70)
         logger.info(f"Profiles scraped:      {len(profiles)}")
         logger.info(f"Recent departures:     {len(departures)}")
-        logger.info(f"Decision-makers found: {len(all_leads)}")
+        logger.info(f"Leads exported:        {len(all_leads)}")
         logger.info(f"Duration:              {duration:.1f}s")
         logger.info("=" * 70)
 
@@ -975,7 +1090,7 @@ class EmployeeDepartureTracker:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Employee Departure Tracker v1.0 - Find decision makers at companies where people recently left"
+        description="Employee Departure Tracker v1.1 - Find decision makers at companies where people recently left"
     )
     parser.add_argument(
         "--sheet-url",

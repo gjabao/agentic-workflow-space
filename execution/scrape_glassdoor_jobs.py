@@ -10,6 +10,7 @@ import json
 import logging
 import time
 import re
+import argparse
 import requests
 import pandas as pd
 from typing import Dict, List, Optional, Any, Generator, Tuple
@@ -17,6 +18,7 @@ from datetime import datetime
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
+from difflib import SequenceMatcher
 from dotenv import load_dotenv
 from apify_client import ApifyClient
 from openai import AzureOpenAI
@@ -48,41 +50,69 @@ logger = logging.getLogger(__name__)
 class AnyMailFinderCompanyAPI:
     """
     Company Email Finder - Returns ALL emails at a company (up to 20)
-    v2.0 Email-First Workflow - Based on Crunchbase v4.0
+    v2.1 Email-First Workflow - Rate limited with retry logic
     """
 
     BASE_URL = "https://api.anymailfinder.com/v5.1/find-email/company"
 
     def __init__(self, api_key: str):
         self.api_key = api_key
-        logger.info("✓ AnyMailFinder Company API initialized (v2.0)")
+        self.rate_limit_lock = Lock()
+        self.last_call_time = 0
+        self.min_delay = 0.2  # 5 req/sec
+        logger.info("✓ AnyMailFinder Company API initialized (v2.1)")
 
     def find_company_emails(self, company_domain: str, company_name: str = None) -> Dict:
-        """Find ALL emails at company (up to 20) in one API call"""
-        try:
-            headers = {
-                'Authorization': self.api_key,
-                'Content-Type': 'application/json'
-            }
-            payload = {
-                'domain': company_domain,
-                'email_type': 'any'
-            }
-            if company_name:
-                payload['company_name'] = company_name
+        """Find ALL emails at company (up to 20) with rate limiting and retry"""
+        # Thread-safe rate limiting
+        with self.rate_limit_lock:
+            elapsed = time.time() - self.last_call_time
+            if elapsed < self.min_delay:
+                time.sleep(self.min_delay - elapsed)
+            self.last_call_time = time.time()
 
-            response = requests.post(self.BASE_URL, headers=headers, json=payload, timeout=15)
+        for attempt in range(3):
+            try:
+                headers = {
+                    'Authorization': self.api_key,
+                    'Content-Type': 'application/json'
+                }
+                payload = {
+                    'domain': company_domain,
+                    'email_type': 'any'
+                }
+                if company_name:
+                    payload['company_name'] = company_name
 
-            if response.status_code == 200:
-                data = response.json()
-                email_status = data.get('email_status', 'not_found')
-                if email_status == 'valid' and data.get('valid_emails'):
-                    return {'emails': data['valid_emails'], 'status': 'found', 'count': len(data['valid_emails'])}
-                return {'emails': [], 'status': 'not-found', 'count': 0}
-            return {'emails': [], 'status': 'not-found', 'count': 0}
-        except Exception as e:
-            logger.debug(f"Error for {company_domain}: {e}")
-            return {'emails': [], 'status': 'not-found', 'count': 0}
+                response = requests.post(self.BASE_URL, headers=headers, json=payload, timeout=15)
+
+                if response.status_code == 200:
+                    data = response.json()
+                    email_status = data.get('email_status', 'not_found')
+                    if email_status == 'valid' and data.get('valid_emails'):
+                        return {'emails': data['valid_emails'], 'status': 'found', 'count': len(data['valid_emails'])}
+                    return {'emails': [], 'status': 'not-found', 'count': 0}
+                elif response.status_code == 401:
+                    raise ValueError("❌ AnyMailFinder API key invalid (401 Unauthorized)")
+                elif response.status_code == 429:
+                    wait_time = 2 ** attempt
+                    logger.warning(f"⚠️ AnyMailFinder rate limited for {company_domain}, waiting {wait_time}s")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.debug(f"API error for {company_domain}: {response.status_code}")
+                    return {'emails': [], 'status': f'error-{response.status_code}', 'count': 0}
+
+            except ValueError:
+                raise  # Re-raise auth errors immediately
+            except Exception as e:
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                    continue
+                logger.debug(f"Error for {company_domain} after 3 attempts: {e}")
+                return {'emails': [], 'status': 'error', 'count': 0}
+
+        return {'emails': [], 'status': 'rate-limited', 'count': 0}
 
 
 class GlassdoorJobScraper:
@@ -94,7 +124,7 @@ class GlassdoorJobScraper:
     SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
 
     # Performance Configuration
-    MAX_WORKERS = int(os.getenv("MAX_WORKERS", "10"))  # Reduced from 20→10 for better rate limiting
+    MAX_WORKERS = int(os.getenv("MAX_WORKERS", "3"))  # 3 outer × 5 inner = 15 threads max
     APIFY_POLL_INTERVAL_START = 1
     APIFY_POLL_INTERVAL_MAX = 5
     APIFY_MAX_WAIT = 600
@@ -418,20 +448,14 @@ class GlassdoorJobScraper:
         max_retries = 2
         for retry in range(max_retries):
             try:
-                # Rate limiting logic - sleep OUTSIDE the lock
-                wait_time = 0
+                # Thread-safe rate limiting: reserve slot inside lock, sleep outside
                 with self.rapidapi_lock:
                     elapsed = time.time() - self.last_rapidapi_call
-                    if elapsed < self.rapidapi_delay:
-                        wait_time = self.rapidapi_delay - elapsed
-                    else:
-                        self.last_rapidapi_call = time.time()
+                    wait_time = max(0, self.rapidapi_delay - elapsed)
+                    self.last_rapidapi_call = time.time() + wait_time
 
                 if wait_time > 0:
                     time.sleep(wait_time)
-                    # Update timestamp after sleep
-                    with self.rapidapi_lock:
-                        self.last_rapidapi_call = time.time()
 
                 headers = {
                     'x-rapidapi-host': 'google-search116.p.rapidapi.com',
@@ -460,38 +484,45 @@ class GlassdoorJobScraper:
                 if not organic_results:
                     return {}
 
-                top_result = organic_results[0]
-                title = top_result.get('title', '')
-                link = top_result.get('url', '')
-                description = top_result.get('description', '')
+                # Find first result with LinkedIn /in/ URL (skip company pages)
+                for result in organic_results:
+                    link = result.get('url', '')
+                    if 'linkedin.com/in/' not in link:
+                        continue
 
-                # Parse name/title logic
-                name_part = title.split('-')[0].strip() if '-' in title else title.strip()
-                dm_title = ""
-                if '-' in title and len(title.split('-')) > 1:
-                    title_part = title.split('-')[1].strip()
-                    if '|' in title_part:
-                        title_part = title_part.split('|')[0].strip()
-                    dm_title = title_part
+                    title = result.get('title', '')
+                    description = result.get('description', '')
 
-                name_parts = name_part.split()
-                if len(name_parts) >= 2:
-                    first_name = name_parts[0]
-                    last_name = ' '.join(name_parts[1:])
-                else:
-                    first_name = name_part
-                    last_name = ""
+                    # Parse name/title logic
+                    name_part = title.split('-')[0].strip() if '-' in title else title.strip()
+                    dm_title = ""
+                    if '-' in title and len(title.split('-')) > 1:
+                        title_part = title.split('-')[1].strip()
+                        if '|' in title_part:
+                            title_part = title_part.split('|')[0].strip()
+                        dm_title = title_part
 
-                # SUCCESS - Found a profile
-                return {
-                    'full_name': name_part,
-                    'first_name': first_name,
-                    'last_name': last_name,
-                    'title': dm_title,
-                    'linkedin_url': link,
-                    'description': description,
-                    'source': f'RapidAPI Google Search (Attempt {attempt_num})'
-                }
+                    name_parts = name_part.split()
+                    if len(name_parts) >= 2:
+                        first_name = name_parts[0]
+                        last_name = ' '.join(name_parts[1:])
+                    else:
+                        first_name = name_part
+                        last_name = ""
+
+                    # SUCCESS - Found a LinkedIn profile
+                    return {
+                        'full_name': name_part,
+                        'first_name': first_name,
+                        'last_name': last_name,
+                        'title': dm_title,
+                        'linkedin_url': link,
+                        'description': description,
+                        'source': f'RapidAPI Google Search (Attempt {attempt_num})'
+                    }
+
+                # No LinkedIn /in/ URL in results
+                return {}
 
             except Exception as e:
                 if retry < max_retries - 1:
@@ -593,18 +624,14 @@ class GlassdoorJobScraper:
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                wait_time = 0
+                # Thread-safe rate limiting: reserve slot inside lock, sleep outside
                 with self.rapidapi_lock:
                     elapsed = time.time() - self.last_rapidapi_call
-                    if elapsed < self.rapidapi_delay:
-                        wait_time = self.rapidapi_delay - elapsed
-                    else:
-                        self.last_rapidapi_call = time.time()
+                    wait_time = max(0, self.rapidapi_delay - elapsed)
+                    self.last_rapidapi_call = time.time() + wait_time
 
                 if wait_time > 0:
                     time.sleep(wait_time)
-                    with self.rapidapi_lock:
-                        self.last_rapidapi_call = time.time()
 
                 headers = {
                     'x-rapidapi-host': 'google-search116.p.rapidapi.com',
@@ -714,11 +741,10 @@ class GlassdoorJobScraper:
         try:
             url = f"https://{domain}"
             response = requests.head(url, timeout=3, allow_redirects=True)
-            # Accept any response that's not a connection error
             if response.status_code < 500:
                 logger.debug(f"    ✓ Domain validated: {domain} (HTTP {response.status_code})")
                 return True
-        except:
+        except Exception:
             pass
 
         # Try HTTP if HTTPS fails
@@ -728,7 +754,7 @@ class GlassdoorJobScraper:
             if response.status_code < 500:
                 logger.debug(f"    ✓ Domain validated: {domain} (HTTP {response.status_code})")
                 return True
-        except:
+        except Exception:
             pass
 
         return False
@@ -738,13 +764,12 @@ class GlassdoorJobScraper:
         if not url:
             return ""
         try:
-            from urllib.parse import urlparse
             parsed = urlparse(url)
             domain = parsed.netloc
             if domain.startswith('www.'):
                 domain = domain[4:]
             return domain
-        except:
+        except Exception:
             return ""
 
 
@@ -762,10 +787,13 @@ class GlassdoorJobScraper:
         if any(pattern in local_part for pattern in generic_patterns):
             return ('', True, 0.0)
 
-        # Pattern 1: firstname.lastname@
+        # Pattern 1: firstname.lastname@ (allow single-letter first initials like q.xu@, b.smith@)
         if '.' in local_part and not local_part.startswith('.') and not local_part.endswith('.'):
             parts = local_part.split('.')
-            valid_parts = [p for p in parts if p.isalpha() and 2 <= len(p) <= 20]
+            valid_parts = []
+            for i, p in enumerate(parts):
+                if p.isalpha() and ((i == 0 and 1 <= len(p) <= 20) or (i > 0 and 2 <= len(p) <= 20)):
+                    valid_parts.append(p)
             if len(valid_parts) == 2:
                 return (f"{valid_parts[0].capitalize()} {valid_parts[1].capitalize()}", False, 0.95)
             elif len(valid_parts) > 2:
@@ -826,30 +854,36 @@ class GlassdoorJobScraper:
 
         # Strategy 3: Fuzzy similarity with SequenceMatcher (Crunchbase-style)
         # Handles typos, slight variations
-        from difflib import SequenceMatcher
         matcher = SequenceMatcher(None, n1, n2)
         similarity = matcher.ratio()
 
         return similarity >= threshold
 
     def is_decision_maker(self, job_title: str) -> bool:
-        """Validate if job title is decision-maker"""
-        if not job_title or len(job_title) < 3:
+        """Validate if job title is decision-maker (regex word-boundary matching)"""
+        if not job_title or len(job_title) < 2:
             return False
         jt_lower = job_title.lower()
 
-        # Must have decision-maker keyword
-        dm_keywords = ['founder', 'co-founder', 'ceo', 'chief', 'owner', 'president',
-                       'managing partner', 'managing director', 'vice president', 'vp ',
-                       'cfo', 'cto', 'coo', 'cmo', 'executive', 'c-suite', 'c-level',
-                       'principal', 'partner', 'executive director']
-        has_dm = any(kw in jt_lower for kw in dm_keywords)
+        # Word-boundary regex prevents partial matches (e.g. "viper" won't match "vp")
+        dm_pattern = r'\b(?:' + '|'.join([
+            r'founder', r'co-founder', r'ceo', r'chief executive', r'chief',
+            r'owner', r'president', r'cfo', r'cto', r'coo', r'cmo',
+            r'c-suite', r'c-level',
+            r'vice president', r'vp', r'svp', r'evp',
+            r'director', r'executive director', r'managing director',
+            r'head of', r'managing partner', r'partner', r'principal',
+            r'executive',
+        ]) + r')\b'
+        has_dm = bool(re.search(dm_pattern, jt_lower))
 
         # Must NOT have exclude keyword
-        exclude_keywords = ['assistant', 'associate', 'junior', 'intern', 'coordinator',
-                           'analyst', 'specialist', 'representative', 'agent', 'clerk',
-                           'trainee', 'apprentice', 'student']
-        has_exclude = any(kw in jt_lower for kw in exclude_keywords)
+        exclude_pattern = r'\b(?:' + '|'.join([
+            r'assistant', r'associate', r'junior', r'intern', r'coordinator',
+            r'analyst', r'specialist', r'representative', r'agent', r'clerk',
+            r'trainee', r'apprentice', r'student',
+        ]) + r')\b'
+        has_exclude = bool(re.search(exclude_pattern, jt_lower))
 
         return has_dm and not has_exclude
 
@@ -1298,6 +1332,7 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
 
         processed_jobs = []
         seen_companies = set()
+        seen_emails = set()  # Cross-company email dedup
 
         # 2. Stream & Process
         print(f"🔄 Streaming & Processing jobs in parallel (workers={self.MAX_WORKERS})...")
@@ -1330,9 +1365,13 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
                 completed += 1
                 try:
                     results = future.result()  # Now returns List[Dict]
-                    if results:  # Multiple DMs per company
-                        processed_jobs.extend(results)  # Extend, not append
-                        # Visual progress indicator - show count of DMs found
+                    if results:
+                        # Cross-company email dedup
+                        for dm in results:
+                            email = dm.get('dm_email', '').lower()
+                            if email and email not in seen_emails:
+                                seen_emails.add(email)
+                                processed_jobs.append(dm)
                         dm_count = len(results)
                         print(f"   ✓ [{completed}/{len(futures)}] {results[0]['company_name']} ({dm_count} DMs)")
                     else:
@@ -1344,8 +1383,9 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
         jobs_with_emails = [job for job in processed_jobs if job.get('dm_email') and job.get('email_status') == 'found']
 
         total_time = time.time() - start_time
-        avg_time_per_company = total_time / len(processed_jobs) if processed_jobs else 0
-        success_rate = len(jobs_with_emails) / len(processed_jobs) * 100 if processed_jobs else 0
+        num_companies = len(seen_companies) or 1
+        avg_time_per_company = total_time / num_companies
+        success_rate = len(jobs_with_emails) / num_companies * 100
 
         print("\n" + "-"*70)
         print(f"📊 PERFORMANCE METRICS:")
