@@ -1,0 +1,64 @@
+{
+  "name": "Product Launch Campaign",
+  "description": "New product announcement with deep dive into features and routine integration",
+  "subject_template": "New Arrival: {product_name}",
+  "preheader_template": "Discover the latest addition to your professional skincare toolkit.",
+  "sections": [
+    {
+      "type": "hero_banner",
+      "render": "image",
+      "model": "recraft-v3",
+      "config": {
+        "headline_template": "NOW AVAILABLE",
+        "subheadline_template": "{product_name} — {product_tagline}",
+        "style_context": "New product launch announcement, elegant reveal, premium feel"
+      }
+    },
+    {
+      "type": "product_feature",
+      "render": "image",
+      "model": "bria-product-shot",
+      "config": {
+        "max_products": 1,
+        "scene_override": "luxurious dark marble surface with soft directional lighting, single product hero shot, editorial beauty photography style",
+        "section_title": "Introducing"
+      }
+    },
+    {
+      "type": "routine_steps",
+      "render": "image",
+      "model": "recraft-v3",
+      "config": {
+        "step_count": 4,
+        "section_title": "How To Use"
+      }
+    },
+    {
+      "type": "story_value",
+      "render": "image",
+      "model": "recraft-v3",
+      "config": {
+        "section_title": "Why Beauty Connect",
+        "value_points": [
+          "Sourced directly from Korea",
+          "Clinical-grade formulations",
+          "Staff training included",
+          "Fast Canadian shipping"
+        ]
+      }
+    },
+    {
+      "type": "cta_banner",
+      "render": "image",
+      "model": "recraft-v3",
+      "config": {
+        "cta_headline": "Be First To Try It",
+        "cta_button_text": "SHOP NOW"
+      }
+    },
+    {
+      "type": "footer",
+      "render": "html"
+    }
+  ]
+}

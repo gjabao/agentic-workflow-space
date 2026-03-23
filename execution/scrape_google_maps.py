@@ -439,7 +439,7 @@ class RapidAPIContactEnricher(RapidAPIGoogleSearch):
         return result
 
     def _process_founder_results(self, results: List[Dict], company_name: str,
-                                  threshold: float = 0.6) -> Dict:
+                                  threshold: float = 0.6, allow_non_linkedin: bool = False) -> Dict:
         """
         Process search results to find founder/decision maker.
         Two-pass strategy:
@@ -1033,7 +1033,7 @@ class GoogleMapsLeadScraper:
             'massage', 'hair salon', 'nail', 'barber',
             'dental', 'dentist', 'orthodont', 'teeth',
             'veterinary', 'vet clinic',
-            'restaurant', 'cafe', 'hotel', 'gym', 'fitness',
+            'restaurant', 'cafe', 'hotel',
             'college', 'university', 'school', 'education',
             'vasectomy', 'urology',
             'medical center', 'medical centre', 'walk-in', 'walk in', 'urgent care',
@@ -1051,6 +1051,22 @@ class GoogleMapsLeadScraper:
             'clinic': ['medical spa', 'medspa', 'med spa', 'skin care clinic', 'beauty clinic'],
             'spa': ['medical spa', 'medspa', 'med spa', 'aesthetic', 'beauty', 'wellness'],
             'medical': ['aesthetic', 'cosmetic', 'dermatology', 'skin care'],
+            # Fashion/clothing related terms
+            'brand': ['clothing store', 'boutique', 'fashion', 'apparel', 'sportswear', 'shop', 'retail', 'store', 'designer'],
+            'clothing': ['boutique', 'fashion', 'apparel', 'sportswear', 'store', 'shop', 'wear', 'garment', 'textile'],
+            'fashion': ['boutique', 'clothing store', 'apparel', 'designer', 'sportswear', 'store', 'shop', 'wear'],
+            'activewear': ['sportswear', 'athletic', 'fitness', 'clothing store', 'apparel', 'shop', 'store'],
+            'athleisure': ['sportswear', 'athletic', 'activewear', 'clothing store', 'apparel', 'shop'],
+            'streetwear': ['clothing store', 'boutique', 'fashion', 'apparel', 'shop', 'store', 'urban'],
+            'swimwear': ['clothing store', 'boutique', 'swimsuit', 'beachwear', 'shop', 'store'],
+            'beachwear': ['clothing store', 'boutique', 'swimwear', 'swimsuit', 'shop', 'store'],
+            'resort': ['clothing store', 'boutique', 'fashion', 'shop', 'store'],
+            'label': ['clothing store', 'boutique', 'fashion', 'apparel', 'designer', 'shop', 'store'],
+            'apparel': ['clothing store', 'boutique', 'fashion', 'sportswear', 'shop', 'store', 'wear'],
+            'yoga': ['sportswear', 'athletic', 'activewear', 'clothing store', 'apparel', 'shop'],
+            'sustainable': ['clothing store', 'boutique', 'fashion', 'apparel', 'shop', 'store', 'eco'],
+            'essentials': ['clothing store', 'boutique', 'fashion', 'apparel', 'basics', 'shop', 'store'],
+            'basics': ['clothing store', 'boutique', 'fashion', 'apparel', 'essentials', 'shop', 'store'],
         }
 
         # Check if category matches query keywords OR related terms
@@ -1151,7 +1167,7 @@ class GoogleMapsLeadScraper:
 
             # Filter non-matching
             if not self.matches_industry(category, search_queries):
-                logger.debug(f"Filtered: {company_name} ({category})")
+                logger.info(f"  ⛔ Filtered: {company_name} (category: '{category}')")
                 filtered_count += 1
                 continue
 
@@ -1283,12 +1299,16 @@ class GoogleMapsLeadScraper:
         base_row = {
             'business_name': company_name,
             'website': website,
+            'domain': domain,
             'full_address': address,
             'type': clinic_type,
+            'category': category,
             'company_social': company_social,
             'city': city,
             'quadrant': quadrant,
             'phone': phone,
+            'total_score': lead.get('total_score', ''),
+            'reviews_count': lead.get('reviews_count', ''),
         }
 
         contacts = []
@@ -1378,7 +1398,11 @@ class GoogleMapsLeadScraper:
 
                 row = base_row.copy()
                 row['email'] = email
-                row['primary_contact'] = full_name 
+                row['primary_contact'] = full_name
+                # Split name for personalization
+                name_parts = full_name.strip().split() if full_name else []
+                row['first_name'] = name_parts[0] if name_parts else ''
+                row['last_name'] = ' '.join(name_parts[1:]) if len(name_parts) > 1 else ''
                 row['job_title'] = job_title
                 row['contact_linkedin'] = contact_linkedin
                 row['personal_instagram'] = ''
@@ -1399,8 +1423,12 @@ class GoogleMapsLeadScraper:
             if founder_info.get('full_name') and founder_info.get('full_name') not in seen_names:
                 if len(contacts) < 10:
                     row = base_row.copy()
-                    row['email'] = '' 
+                    row['email'] = ''
                     row['primary_contact'] = founder_info['full_name']
+                    # Split name for personalization
+                    fname_parts = founder_info['full_name'].strip().split()
+                    row['first_name'] = fname_parts[0] if fname_parts else ''
+                    row['last_name'] = ' '.join(fname_parts[1:]) if len(fname_parts) > 1 else ''
                     row['job_title'] = founder_info.get('job_title', '')
                     row['contact_linkedin'] = founder_info.get('contact_linkedin', '')
                     row['personal_instagram'] = ''
@@ -1453,17 +1481,23 @@ class GoogleMapsLeadScraper:
                         fallback_row = {
                             'business_name': lead.get('company_name'),
                             'primary_contact': '',
+                            'first_name': '',
+                            'last_name': '',
                             'phone': lead.get('phone'),
                             'email': generic_email,
-                            'city': '',  # City extracted in enrichment usually
+                            'city': '',
                             'job_title': '',
                             'contact_linkedin': '',
                             'website': lead.get('website'),
+                            'domain': lead.get('domain', ''),
                             'full_address': lead.get('address'),
                             'type': lead.get('category'),
+                            'category': lead.get('category', ''),
                             'quadrant': '',
                             'company_social': '',
-                            'personal_instagram': ''
+                            'personal_instagram': '',
+                            'total_score': lead.get('total_score', ''),
+                            'reviews_count': lead.get('reviews_count', ''),
                         }
                         all_contacts.append(fallback_row)
 
@@ -1522,11 +1556,13 @@ class GoogleMapsLeadScraper:
             if not rows:
                 return spreadsheet_url
 
-            # 13 columns as per MD file (updated order: name/contact/phone/email/city first)
+            # Updated columns with First/Last Name split + enrichment for cold email personalization
             headers = [
-                "Business Name", "Primary Contact", "Phone", "Email", "City",
-                "Job Title", "Contact LinkedIn", "Website", "Full Address",
-                "Type", "Quadrant", "Company Social", "Personal Instagram"
+                "Business Name", "First Name", "Last Name", "Primary Contact",
+                "Phone", "Email", "City", "Job Title", "Contact LinkedIn",
+                "Website", "Domain", "Full Address", "Category", "Type",
+                "Google Rating", "Reviews Count", "Quadrant",
+                "Company Social", "Personal Instagram"
             ]
 
             values = [headers]
@@ -1534,6 +1570,8 @@ class GoogleMapsLeadScraper:
             for row in rows:
                 values.append([
                     row.get('business_name', ''),
+                    row.get('first_name', ''),
+                    row.get('last_name', ''),
                     row.get('primary_contact', ''),
                     row.get('phone', ''),
                     row.get('email', ''),
@@ -1541,8 +1579,12 @@ class GoogleMapsLeadScraper:
                     row.get('job_title', ''),
                     row.get('contact_linkedin', ''),
                     row.get('website', ''),
+                    row.get('domain', ''),
                     row.get('full_address', ''),
+                    row.get('category', ''),
                     row.get('type', ''),
+                    row.get('total_score', ''),
+                    row.get('reviews_count', ''),
                     row.get('quadrant', ''),
                     row.get('company_social', ''),
                     row.get('personal_instagram', '')
@@ -1605,9 +1647,11 @@ class GoogleMapsLeadScraper:
             csv_path = f".tmp/leads_{filename}_{timestamp}.csv"
 
             headers = [
-                "Business Name", "Primary Contact", "Phone", "Email", "City",
-                "Job Title", "Contact LinkedIn", "Website", "Full Address",
-                "Type", "Quadrant", "Company Social", "Personal Instagram"
+                "Business Name", "First Name", "Last Name", "Primary Contact",
+                "Phone", "Email", "City", "Job Title", "Contact LinkedIn",
+                "Website", "Domain", "Full Address", "Category", "Type",
+                "Google Rating", "Reviews Count", "Quadrant",
+                "Company Social", "Personal Instagram"
             ]
 
             with open(csv_path, 'w', newline='', encoding='utf-8') as f:
@@ -1617,6 +1661,8 @@ class GoogleMapsLeadScraper:
                 for row in rows:
                     writer.writerow({
                         "Business Name": row.get('business_name', ''),
+                        "First Name": row.get('first_name', ''),
+                        "Last Name": row.get('last_name', ''),
                         "Primary Contact": row.get('primary_contact', ''),
                         "Phone": row.get('phone', ''),
                         "Email": row.get('email', ''),
@@ -1624,8 +1670,12 @@ class GoogleMapsLeadScraper:
                         "Job Title": row.get('job_title', ''),
                         "Contact LinkedIn": row.get('contact_linkedin', ''),
                         "Website": row.get('website', ''),
+                        "Domain": row.get('domain', ''),
                         "Full Address": row.get('full_address', ''),
+                        "Category": row.get('category', ''),
                         "Type": row.get('type', ''),
+                        "Google Rating": row.get('total_score', ''),
+                        "Reviews Count": row.get('reviews_count', ''),
                         "Quadrant": row.get('quadrant', ''),
                         "Company Social": row.get('company_social', ''),
                         "Personal Instagram": row.get('personal_instagram', '')

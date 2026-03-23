@@ -26,7 +26,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from fuzzywuzzy import fuzz
 from apify_client import ApifyClient
-from openai import AzureOpenAI
+from openai import AzureOpenAI, OpenAI
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
@@ -280,17 +280,26 @@ class ApifyLeadScraper:
 
         self.client = ApifyClient(self.apify_token)
         self.verifier = AnyMailFinderVerifier(self.anymailfinder_token) if self.anymailfinder_token else None
-        # Initialize icebreaker generator with Azure OpenAI
+        # Initialize icebreaker generator — prefer OpenAI API, fallback to Azure OpenAI
+        openai_key = os.getenv("OPENAI_API_KEY")
         azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
         azure_key = os.getenv("AZURE_OPENAI_API_KEY")
         azure_deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
-        self.icebreaker_gen = IcebreakerGenerator(azure_endpoint, azure_key, azure_deployment) if (azure_endpoint and azure_key) else None
+
+        if openai_key:
+            self.icebreaker_gen = IcebreakerGenerator(None, openai_key, "gpt-4o", provider="openai")
+            logger.info("✓ Using OpenAI API for icebreaker generation")
+        elif azure_endpoint and azure_key:
+            self.icebreaker_gen = IcebreakerGenerator(azure_endpoint, azure_key, azure_deployment, provider="azure")
+            logger.info("✓ Using Azure OpenAI for icebreaker generation")
+        else:
+            self.icebreaker_gen = None
 
         if not self.verifier:
             logger.warning("⚠️ ANYMAILFINDER_API_KEY not found. Email verification will be skipped.")
 
         if not self.icebreaker_gen:
-            logger.warning("⚠️ Azure OpenAI credentials not found. Icebreaker generation will be skipped.")
+            logger.warning("⚠️ No OpenAI credentials found. Icebreaker generation will be skipped.")
         
         self.output_dir = '.tmp/scraped_data'
         os.makedirs(self.output_dir, exist_ok=True)
@@ -657,7 +666,9 @@ class ApifyLeadScraper:
         headers = [
             "Company Name", "Website", "Industry", "Location", "Size", "Revenue",
             "First Name", "Last Name", "Job Title", "Email", "Email Status",
-            "Verification Status", "Icebreaker", "Phone", "LinkedIn", "Company LinkedIn"
+            "Verification Status", "Icebreaker 1", "Icebreaker 2", "Icebreaker 3",
+            "Icebreaker 4",
+            "Phone", "LinkedIn", "Company LinkedIn"
         ]
 
         with open(filename, 'w', newline='', encoding='utf-8') as f:
@@ -678,7 +689,10 @@ class ApifyLeadScraper:
                     "Email": lead.get('email', ''),
                     "Email Status": lead.get('email_status', ''),
                     "Verification Status": lead.get('verification_status', 'Not Checked'),
-                    "Icebreaker": lead.get('icebreaker', ''),
+                    "Icebreaker 1": lead.get('icebreaker_1', ''),
+                    "Icebreaker 2": lead.get('icebreaker_2', ''),
+                    "Icebreaker 3": lead.get('icebreaker_3', ''),
+                    "Icebreaker 4": lead.get('icebreaker_4', ''),
                     "Phone": lead.get('mobile_number', '') or lead.get('company_phone', ''),
                     "LinkedIn": lead.get('linkedin', ''),
                     "Company LinkedIn": lead.get('company_linkedin', '')
@@ -751,12 +765,13 @@ class ApifyLeadScraper:
             # We'll use a standard schema for consistency
             headers = [
                 "Company Name", "Website", "Industry", "Location", "Size", "Revenue",
-                "First Name", "Last Name", "Job Title", "Email", "Email Status", "Verification Status", "Icebreaker",
+                "First Name", "Last Name", "Job Title", "Email", "Email Status", "Verification Status",
+                "Icebreaker 1", "Icebreaker 2", "Icebreaker 3", "Icebreaker 4",
                 "Phone", "LinkedIn", "Company LinkedIn"
             ]
-            
+
             values = [headers]
-            
+
             for lead in leads:
                 row = [
                     lead.get('company_name', ''),
@@ -771,7 +786,10 @@ class ApifyLeadScraper:
                     lead.get('email', ''),
                     lead.get('email_status', ''),
                     lead.get('verification_status', 'Not Checked'),
-                    lead.get('icebreaker', ''),
+                    lead.get('icebreaker_1', ''),
+                    lead.get('icebreaker_2', ''),
+                    lead.get('icebreaker_3', ''),
+                    lead.get('icebreaker_4', ''),
                     lead.get('mobile_number', '') or lead.get('company_phone', ''),
                     lead.get('linkedin', ''),
                     lead.get('company_linkedin', '')
@@ -1032,7 +1050,12 @@ class ApifyLeadScraper:
                     email_map = {l['email']: l for l in processed_leads}
                     for lead in full_leads:
                         if lead.get('email') in email_map:
-                            lead['icebreaker'] = email_map[lead['email']].get('icebreaker', '')
+                            src = email_map[lead['email']]
+                            lead['icebreaker'] = src.get('icebreaker', '')
+                            lead['icebreaker_1'] = src.get('icebreaker_1', '')
+                            lead['icebreaker_2'] = src.get('icebreaker_2', '')
+                            lead['icebreaker_3'] = src.get('icebreaker_3', '')
+                            lead['icebreaker_4'] = src.get('icebreaker_4', '')
 
                     logger.info(f"✓ Generated icebreakers for {len(processed_leads)} leads")
             
@@ -1132,41 +1155,73 @@ class ApifyLeadScraper:
 
 
 class IcebreakerGenerator:
-    """Generates personalized icebreakers using Azure OpenAI with SSM SOP."""
+    """Generates personalized icebreakers using Azure OpenAI or OpenAI with SSM SOP."""
 
-    def __init__(self, azure_endpoint: str, api_key: str, deployment_name: str):
-        self.client = AzureOpenAI(
-            azure_endpoint=azure_endpoint,
-            api_key=api_key,
-            api_version="2024-02-15-preview"
-        )
+    def __init__(self, azure_endpoint: str, api_key: str, deployment_name: str, provider: str = "azure"):
+        self.provider = provider
+        if provider == "azure":
+            self.client = AzureOpenAI(
+                azure_endpoint=azure_endpoint,
+                api_key=api_key,
+                api_version="2024-02-15-preview"
+            )
+        else:
+            self.client = OpenAI(api_key=api_key)
         self.deployment_name = deployment_name
 
     def _sanitize_text(self, text: str) -> str:
         """Sanitize input text to prevent Azure content filter triggers."""
         if not text:
             return ""
-        # Remove curly braces that might trigger jailbreak detection
+        # Remove double curly braces that might trigger jailbreak detection
         text = text.replace('{{', '').replace('}}', '')
-        # Remove other potentially problematic characters
-        text = text.replace('[', '').replace(']', '')
         # Limit length to avoid token issues
         text = text[:200]
         return text.strip()
 
+    def _has_raw_placeholders(self, text: str) -> bool:
+        """Check if text contains unfilled template placeholders."""
+        bracket_pattern = r'\[[\w_]+\]'
+        curly_pattern = r'\{\{[\w_]+\}\}'
+        return bool(re.search(bracket_pattern, text)) or bool(re.search(curly_pattern, text))
+
+    def _clean_icebreaker_output(self, text: str, clean_name: str, industry: str) -> str:
+        """Best-effort regex cleanup of remaining placeholders."""
+        replacements = {
+            r'\[company_name\]': clean_name,
+            r'\[clean_name\]': clean_name,
+            r'\[industry_type\]': industry,
+            r'\[target_icp\]': industry,
+            r'\[function_area\]': 'business development',
+            r'\[relevant_function\]': 'business development',
+            r'\[relevant function\]': 'business development',
+            r'\[target_department\]': 'growth',
+            r'\[relevant department\]': 'growth',
+            r'\[opportunity_description\]': 'companies actively looking for partners',
+            r'\{\{company_name\}\}': clean_name,
+            r'\{\{industry_type\}\}': industry,
+            r'\{\{target_icp\}\}': industry,
+            r'\{\{function_area\}\}': 'business development',
+            r'\{\{opportunity_description\}\}': 'companies actively looking for partners',
+        }
+        result = text
+        for pattern, replacement in replacements.items():
+            result = re.sub(pattern, replacement, result, flags=re.IGNORECASE)
+        return result
+
     async def generate_bulk(self, leads: List[Dict], sender_context: str = "") -> List[Dict]:
         """
-        Generate icebreakers for a list of leads in parallel using SSM SOP Connector framework.
-        Rotates through 6 prompt variations to avoid market fatigue.
+        Generate personalized cold email messages for a list of leads using Azure OpenAI.
+        Uses a Connector-style template that positions sender as an industry insider.
         """
-        import random
-        logger.info(f"Generating SSM Connector icebreakers for {len(leads)} leads...")
-        
+        logger.info(f"Generating personalized messages for {len(leads)} leads...")
+
         async def process_lead(lead):
             if not lead.get('company_name') or not lead.get('job_title'):
                 return lead
 
             # Sanitize inputs to prevent content filter issues
+            first_name = self._sanitize_text(lead.get('first_name', ''))
             company_name = self._sanitize_text(lead.get('company_name', ''))
             job_title = self._sanitize_text(lead.get('job_title', ''))
             industry = self._sanitize_text(lead.get('company_industry') or lead.get('industry', 'marketing'))
@@ -1179,159 +1234,97 @@ class IcebreakerGenerator:
                     clean_name = clean_name[:-len(suffix)].strip()
                     break
 
-            # SSM SOP Connector Prompts (6 variations for rotation)
-            prompts = [
-                # PROMPT #1 — Company-Based Connector Insight
-                f"""You are a Connector writing a cold email opener.
+            prompt_text = f"""You are a Connector writing personalized cold email pieces for outreach.
 
 INPUT DATA:
-- Company: {company_name}
-- Clean Name: {clean_name}
+- First Name: {first_name}
+- Company: {company_name} (shortened: {clean_name})
 - Job Title: {job_title}
 - Industry: {industry}
-- Description: {description if description else 'marketing and advertising services'}
+- Description: {description if description else 'business services'}
+- Sender Context: {sender_context if sender_context else 'business development professional'}
 
-TASK: Write using this EXACT format:
-Noticed [clean_company_name] helps [job_titles] at [company_type] — I know a few who [pain_description]
+STEP 1 — INFER TARGET ICP:
+Based on the company's industry and description, determine WHO their ideal customers/clients are.
+This is NOT the company's own industry — it's the type of businesses or people they SERVE.
+Examples:
+- A "digital marketing agency" serves → "e-commerce brands" or "DTC companies"
+- A "solar installer lead gen company" serves → "residential solar installers" or "solar EPC firms"
+- A "SaaS recruiting platform" serves → "tech startups" or "engineering-heavy companies"
+- A "commercial real estate brokerage" serves → "property investors" or "retail tenants"
 
-RULES:
-- [clean_company_name] = Use "{clean_name}" (abbreviated, no Inc/LLC)
-- [job_titles] = Plural roles they target (e.g., "CEOs," "marketing directors")
-- [company_type] = Specific type (e.g., "mid-market tech companies," "B2B SaaS firms")
-- [pain_description] = Operator complaint (e.g., "waste hours on," "can't find," "struggle with")
-- NO corporate speak: avoid "solutions," "leverage," "optimize," "streamline," "platform"
-- ONE sentence only
-- No punctuation at end
-- Write like the buyer complains to a friend
+STEP 2 — WRITE 4 PIECES using the inferred ICP. Output EXACTLY 4 pieces separated by "|||":
 
-Output ONLY the opener, nothing else.""",
-
-                # PROMPT #2 — Connector Insight from Market Conversations
-                f"""You are a Connector writing a cold email opener.
-
-INPUT DATA:
-- Job Title: {job_title}
-- Industry: {industry}
-
-TASK: Write using this EXACT format:
-Figured I'd reach out — I talk to a lot of [dreamICP] and they keep saying they [painTheySolve]
+PIECE 1: I've been tracking <target ICP> teams <what they actively do> <their service/product focus> for <a relatable business goal>. Specifically ones with <signal 1>, <signal 2>, or <signal 3>
+|||
+PIECE 2: Figured with {clean_name}'s portfolio in <their specialty> and <related service area>, you're probably already talking to the right people on the <relevant department> side
+|||
+PIECE 3: Got a list of <target ICP> <what the list contains — e.g. "partnership leads", "expansion opportunities">. Are you the right person to share it with, or do you have someone else handling <relevant function — e.g. "business development", "partnerships">?
+|||
+PIECE 4: Know this is out of left field—I've had a couple conversations recently with <target ICP group>, they need <specific service/need relevant to their world>
 
 RULES:
-- [dreamICP] = Plural ICP group (e.g., "founders in logistics," "CEOs in SaaS," "marketing directors in B2B")
-- [painTheySolve] = Operator complaint (e.g., "can't keep up," "waste hours on," "struggle to find")
-- NO corporate speak: avoid "optimize," "solutions," "scalable," "streamline"
-- Keep conversational, like overheard in hallway
-- ONE sentence only
-- No punctuation at end
+- Replace ALL angle-bracket placeholders with specific, inferred values. Your output must contain ZERO angle brackets, square brackets, or curly braces
+- {clean_name} in PIECE 2 is already filled in — do NOT change it
+- PIECE 4 MUST start with "Know this is out of left field—" exactly
+- NO corporate speak: avoid "solutions," "leverage," "optimize," "streamline," "synergy"
+- Keep it conversational — like a well-connected peer, not a salesperson
+- No punctuation at the end of any piece
+- No "PIECE 1:", "PIECE 2:" prefixes — just the raw text
+- Spartan/Laconic tone — short, simple, professional
+- Imply familiarity wherever possible
+- Shorten and normalize company names
+- Use simple language — focus on WHAT they do, not HOW
 
-Output ONLY the opener, nothing else.""",
+CRITICAL: Your output must be plain text with ALL placeholders filled in. Do NOT output any brackets, braces, or template variables. Output ONLY the 4 pieces separated by |||, nothing else."""
 
-                # PROMPT #3 — "I'm Around Them Daily" Spine
-                f"""You are a Connector writing a cold email opener.
+            max_attempts = 2
+            raw = None
 
-INPUT DATA:
-- Job Title: {job_title}
-- Industry: {industry}
+            for attempt in range(max_attempts):
+                try:
+                    response = await asyncio.to_thread(
+                        self.client.chat.completions.create,
+                        model=self.deployment_name,
+                        messages=[
+                            {"role": "system", "content": "You are an expert at writing personalized Connector-style cold emails. Output ONLY the 4 pieces separated by |||. No explanations. Do NOT include any brackets or placeholder text."},
+                            {"role": "user", "content": prompt_text}
+                        ],
+                        temperature=0.7 if attempt == 0 else 0.5,
+                        max_tokens=400
+                    )
+                    raw = response.choices[0].message.content.strip()
 
-TASK: Write using this EXACT format:
-Figured I'd reach out — I'm around [dreamICP] daily and they keep saying they [painTheySolve]
+                    if not self._has_raw_placeholders(raw):
+                        break  # Clean output
 
-RULES:
-- [dreamICP] = Plural ICP group (e.g., "founders in logistics," "CEOs in SaaS")
-- [painTheySolve] = Natural complaint (e.g., "can't keep up," "waste hours on," "never find reliable partners")
-- NO corporate speak
-- ONE sentence only
-- No punctuation at end
-- Must feel like real operator sharing what they hear daily
+                    if attempt == 0:
+                        logger.warning(f"Icebreaker for {lead.get('email')} contains raw placeholders, retrying...")
 
-Output ONLY the opener, nothing else.""",
+                except Exception as e:
+                    logger.error(f"Error generating icebreaker for {lead.get('email')} (attempt {attempt+1}): {e}")
+                    raw = None
 
-                # PROMPT #4 — "Saw Some Movement on My Side" (Deal-Flow)
-                f"""You are a Connector writing a cold email opener.
+            if raw:
+                # Post-process: clean any remaining placeholders as last resort
+                raw = self._clean_icebreaker_output(raw, clean_name, industry)
 
-INPUT DATA:
-- Job Title: {job_title}
-- Industry: {industry}
+                # Strip common LLM prefixes like "PIECE 1:" or "1."
+                parts = [p.strip() for p in raw.split('|||')]
+                parts = [re.sub(r'^(PIECE\s*\d+[:\s]*|\d+[.\):\s]+)', '', p).strip() for p in parts]
 
-TASK: Write using this EXACT format:
-Saw some movement on my side — I'm around [dreamICP] daily and they keep saying they [painTheySolve]
-
-RULES:
-- [dreamICP] = Plural ICP group (e.g., "founders in logistics," "CEOs in mid-market manufacturing")
-- [painTheySolve] = Real complaint (e.g., "can't keep up," "waste hours chasing," "never get reliable timelines")
-- NO corporate speak
-- ONE sentence only
-- No punctuation at end
-- Tone: operator, insider, plugged-in
-
-Output ONLY the opener, nothing else.""",
-
-                # PROMPT #5 — "Your Name Came Up On My End" (Ultra-Operator)
-                f"""You are a Connector writing a cold email opener.
-
-INPUT DATA:
-- Job Title: {job_title}
-- Industry: {industry}
-
-TASK: Write using this EXACT format:
-Your name came up on my end — I'm around [dreamICP] daily and they keep saying they [painTheySolve]
-
-RULES:
-- [dreamICP] = Plural ICP group (e.g., "founders in logistics," "HR directors in mid-market manufacturing")
-- [painTheySolve] = Natural complaint (e.g., "can't keep up," "never find reliable vendors," "waste hours chasing")
-- NO corporate speak
-- ONE sentence only
-- No punctuation at end
-- Tone: insider, operator, plugged-in
-
-Output ONLY the opener, nothing else.""",
-
-                # PROMPT #6 — "Got a Signal That Fits You" (Most Premium)
-                f"""You are a Connector writing a cold email opener.
-
-INPUT DATA:
-- Job Title: {job_title}
-- Industry: {industry}
-
-TASK: Write using this EXACT format:
-Got a signal that fits you — I'm around [dreamICP] daily and they keep saying they [painTheySolve]
-
-RULES:
-- [dreamICP] = Plural ICP group (e.g., "founders in logistics," "CEOs in SaaS")
-- [painTheySolve] = Real complaint (e.g., "can't keep up," "never find partners who move fast," "waste hours chasing")
-- NO corporate speak
-- ONE sentence only
-- No punctuation at end
-- Tone: exclusive, operator, deal-flow insider
-
-Output ONLY the opener, nothing else."""
-            ]
-
-            # Randomly select one of the 6 prompts for rotation
-            prompt_text = random.choice(prompts)
-
-            try:
-                response = await asyncio.to_thread(
-                    self.client.chat.completions.create,
-                    model=self.deployment_name,
-                    messages=[
-                        {"role": "system", "content": "You are an expert at SSM Connector-style cold email openers. Output ONLY the opener text, no explanations."},
-                        {"role": "user", "content": prompt_text}
-                    ],
-                    temperature=0.7,
-                    max_tokens=100
-                )
-                icebreaker = response.choices[0].message.content.strip()
-                
-                # Remove any trailing punctuation
-                while icebreaker and icebreaker[-1] in '.!?,;:':
-                    icebreaker = icebreaker[:-1]
-                
-                lead['icebreaker'] = icebreaker
-            except Exception as e:
-                logger.error(f"Error generating icebreaker for {lead.get('email')}: {e}")
-                # Fallback to a generic connector-style icebreaker
-                lead['icebreaker'] = f"Figured I'd reach out — I'm around {job_title}s in {industry} daily and they keep saying they need better partners"
+                lead['icebreaker_1'] = parts[0] if len(parts) > 0 else ''
+                lead['icebreaker_2'] = parts[1] if len(parts) > 1 else ''
+                lead['icebreaker_3'] = parts[2] if len(parts) > 2 else ''
+                lead['icebreaker_4'] = parts[3] if len(parts) > 3 else ''
+                lead['icebreaker'] = f"{lead['icebreaker_1']}\n{lead['icebreaker_2']}\n{lead['icebreaker_3']}"
+            else:
+                # Complete fallback
+                lead['icebreaker_1'] = f"I've been tracking {industry} teams scaling their outreach for pipeline growth. Specifically ones with recent hires, new funding, or expanding into new markets"
+                lead['icebreaker_2'] = f"Figured with {clean_name}'s portfolio in {industry} and related services, you're probably already talking to the right people on the growth side"
+                lead['icebreaker_3'] = f"Got a list of {industry} companies actively looking for partners. Are you the right person to share it with, or do you have someone else handling business development?"
+                lead['icebreaker_4'] = f"Know this is out of left field—I've had a couple conversations recently with {industry} leaders, they need better partners for growth"
+                lead['icebreaker'] = f"{lead['icebreaker_1']}\n{lead['icebreaker_2']}\n{lead['icebreaker_3']}"
 
             return lead
 
@@ -1485,6 +1478,7 @@ def main():
     parser.add_argument('--company_size', nargs='+', help='Company size ranges (e.g., "11-50" "51-100")')
     parser.add_argument('--company_keywords', nargs='+', help='Company keywords')
     parser.add_argument('--company_industry', nargs='+', help='Specific Apify company industries')
+    parser.add_argument('--seniority_level', nargs='+', help='Seniority levels (e.g., "owner" "founder" "director" "c_suite" "vp")')
     parser.add_argument('--skip_test', action='store_true', help='Skip the test run and validation phase')
     parser.add_argument('--valid_only', action='store_true', help='Export only verified valid emails')
     parser.add_argument('--sender_context', help='Context about the sender for SSM prompts', default="")

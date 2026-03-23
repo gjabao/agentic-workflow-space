@@ -1,0 +1,53 @@
+{
+  "brand_name": "Beauty Connect Shop",
+  "tagline": "Professional Beauty Products",
+  "store_url": "https://beautyconnectshop.com",
+  "shopify_domain": "beautyconnectshop.myshopify.com",
+
+  "colors": {
+    "primary_dark": "#2C1810",
+    "primary_gold": "#DFBA90",
+    "primary_cream": "#FAF8F5",
+    "secondary_gray": "#8B7D6B",
+    "secondary_light_gold": "#F0E0CC",
+    "white": "#FFFFFF",
+    "black": "#121212"
+  },
+
+  "fal_color_palette": ["#2C1810", "#DFBA90", "#FAF8F5", "#8B7D6B"],
+
+  "fonts": {
+    "heading": "Proza Libre",
+    "body": "Arial, Helvetica, sans-serif",
+    "heading_weights": [600, 700, 800],
+    "body_weight": 400
+  },
+
+  "email": {
+    "width": 600,
+    "max_html_size_kb": 90,
+    "max_image_size_kb": 200,
+    "preheader_max_chars": 90
+  },
+
+  "social": {
+    "instagram": "https://instagram.com/beautyconnectshop",
+    "facebook": "https://facebook.com/beautyconnectshop",
+    "website": "https://beautyconnectshop.com"
+  },
+
+  "logo_url": "",
+
+  "fal_defaults": {
+    "recraft_v3": {
+      "style": "realistic_image",
+      "size": "landscape_16_9",
+      "style_keywords": "luxury spa aesthetic, dramatic golden lighting, rich textures, premium beauty brand, dynamic composition with floating botanical elements, bokeh light particles, soft cream serum swirls"
+    },
+    "bria_product_shot": {
+      "scene_default": "luxurious white marble surface with gold veining, soft golden glow behind product, cream serum splashing at base, floating flower petals and green tea leaves, bokeh light orbs, premium spa environment, dramatic studio lighting",
+      "placement_type": "manual_placement",
+      "shot_size": [600, 400]
+    }
+  }
+}

@@ -1,0 +1,58 @@
+{
+  "name": "Promo Sale Campaign",
+  "description": "Seasonal sale or discount promotion with product showcase and urgency",
+  "subject_template": "{promo_name} — {discount} Off Professional Skincare",
+  "preheader_template": "Use code {promo_code} at checkout. Limited time only.",
+  "sections": [
+    {
+      "type": "hero_banner",
+      "render": "image",
+      "model": "recraft-v3",
+      "config": {
+        "headline_template": "{discount} OFF SITEWIDE",
+        "subheadline_template": "Professional Korean Skincare for Your Clinic",
+        "style_context": "Promotional sale banner with urgency feel, elegant not aggressive"
+      }
+    },
+    {
+      "type": "product_showcase",
+      "render": "image",
+      "model": "bria-product-shot",
+      "config": {
+        "max_products": 3,
+        "scene_override": null,
+        "section_title": "Featured Products"
+      }
+    },
+    {
+      "type": "promo_code",
+      "render": "html",
+      "config": {
+        "show_expiry": true,
+        "personalize_greeting": true
+      }
+    },
+    {
+      "type": "reviews",
+      "render": "image",
+      "model": "recraft-v3",
+      "config": {
+        "review_count": 3,
+        "section_title": "What Professionals Say"
+      }
+    },
+    {
+      "type": "cta_banner",
+      "render": "image",
+      "model": "recraft-v3",
+      "config": {
+        "cta_headline": "Don't Miss Out",
+        "cta_button_text": "SHOP NOW & SAVE"
+      }
+    },
+    {
+      "type": "footer",
+      "render": "html"
+    }
+  ]
+}

@@ -520,6 +520,20 @@ This error pattern will **never occur again** in this codebase.
 
 ---
 
+## Reverse Prompting
+
+Before executing any non-trivial task, ask **5 clarifying questions** to surface hidden assumptions. Only after receiving answers, create a prompt contract (clear scope + expected output). Then execute.
+
+**Why:** One-shot success rate increases dramatically when assumptions are validated upfront.
+
+**Protocol:**
+1. Receive task request
+2. Ask 5 targeted clarifying questions (scope, format, constraints, edge cases, priorities)
+3. Synthesize answers into a prompt contract
+4. Execute with high confidence
+
+---
+
 ## TL;DR
 
 1. **Read** directives (intent)
