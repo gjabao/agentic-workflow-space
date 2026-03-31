@@ -460,10 +460,6 @@ class ShopifyClient:
                   title
                   handle
                 }
-                seo {
-                  title
-                  description
-                }
                 image {
                   url
                   altText

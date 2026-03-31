@@ -321,18 +321,23 @@ class ReedJobScraper:
                     normalized_company = self.normalize_company_name(company)
                     normalized_title = self.normalize_job_title(title)
 
+                    posted_date_raw = item.get('datePosted', '')
+                    job_age_days, pain_level = self.parse_job_age(posted_date_raw)
+
                     jobs_yielded += 1
                     yield {
                         'company_name': normalized_company if normalized_company else company,
                         'job_title': normalized_title if normalized_title else title,
                         'job_url': item.get('url', ''),
                         'job_description': item.get('description_text', ''),
-                        'posted_date': item.get('datePosted', ''),
+                        'posted_date': posted_date_raw,
                         'location': item.get('location', ''),
                         'salary_range': item.get('salary', ''),
                         'employment_type': item.get('employmentType', ''),
                         'company_industry': '',
-                        'company_rating': ''
+                        'company_rating': '',
+                        'job_age_days': job_age_days,
+                        'pain_level': pain_level
                     }
 
                 offset += len(items)
@@ -882,6 +887,121 @@ class ReedJobScraper:
 
         return has_tier3 and not has_exclude
 
+    def is_decision_maker_by_size(self, job_title: str, company_size: str = "medium") -> bool:
+        """Size-aware decision maker validation."""
+        if not job_title or len(job_title) < 3:
+            return False
+        jt_lower = job_title.lower()
+        exclude_keywords = ['intern', 'trainee', 'apprentice', 'student', 'clerk']
+        if any(kw in jt_lower for kw in exclude_keywords):
+            return False
+        if company_size == "small":
+            dm_keywords = ['founder', 'co-founder', 'ceo', 'chief executive',
+                          'owner', 'president', 'managing director']
+        elif company_size == "medium":
+            dm_keywords = ['founder', 'co-founder', 'ceo', 'chief executive',
+                          'owner', 'president', 'managing director',
+                          'hr manager', 'human resources manager',
+                          'people lead', 'head of people', 'head of hr',
+                          'head of human resources', 'people manager',
+                          'talent manager', 'hr lead']
+        else:
+            dm_keywords = ['founder', 'co-founder', 'ceo', 'chief executive',
+                          'owner', 'president', 'managing director',
+                          'hr director', 'director of hr', 'director of human resources',
+                          'head of hr', 'head of people', 'head of human resources',
+                          'vp of people', 'vp people', 'vp hr', 'vp human resources',
+                          'chief people officer', 'cpo']
+        return any(kw in jt_lower for kw in dm_keywords)
+
+    def _google_search(self, query: str, num_results: int = 3) -> Optional[Dict]:
+        """Generic Google search via RapidAPI (for signal checks)."""
+        if not self.rapidapi_key:
+            return None
+        with self.rapidapi_lock:
+            elapsed = time.time() - self.last_rapidapi_call
+            wait_time = max(0, self.rapidapi_delay - elapsed)
+            self.last_rapidapi_call = time.time() + wait_time
+        if wait_time > 0:
+            time.sleep(wait_time)
+        try:
+            headers = {'x-rapidapi-host': 'google-search116.p.rapidapi.com', 'x-rapidapi-key': self.rapidapi_key}
+            params = {'query': query, 'num': str(num_results)}
+            response = requests.get(self.RAPIDAPI_GOOGLE_SEARCH_URL, headers=headers, params=params, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                return {'results': [{'url': r.get('url', ''), 'title': r.get('title', ''), 'snippet': r.get('description', '')} for r in data.get('results', [])]}
+        except Exception as e:
+            logger.debug(f"Google search error: {e}")
+        return None
+
+    def parse_job_age(self, posted_date_str: str) -> Tuple[int, str]:
+        """Parse job posting date and calculate age. Returns (age_days, pain_level)."""
+        if not posted_date_str:
+            return (-1, "unknown")
+        posted_str = posted_date_str.strip().lower()
+        age_days = -1
+        relative_match = re.match(r'(\d+)\s*(day|week|month|hour|minute)s?\s*ago', posted_str)
+        if relative_match:
+            num = int(relative_match.group(1))
+            unit = relative_match.group(2)
+            if unit == 'day': age_days = num
+            elif unit == 'week': age_days = num * 7
+            elif unit == 'month': age_days = num * 30
+            elif unit in ('hour', 'minute'): age_days = 0
+        else:
+            for fmt in ['%Y-%m-%d', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M:%S.%fZ', '%Y-%m-%dT%H:%M:%SZ']:
+                try:
+                    posted_date = datetime.strptime(posted_date_str.strip(), fmt)
+                    age_days = (datetime.now() - posted_date).days
+                    break
+                except ValueError:
+                    continue
+        if age_days < 0: return (age_days, "unknown")
+        elif age_days >= 30: return (age_days, "high")
+        elif age_days >= 14: return (age_days, "medium")
+        else: return (age_days, "low")
+
+    def estimate_company_size(self, company_name: str) -> Tuple[str, int]:
+        """Estimate company size from LinkedIn company page via Google Search."""
+        max_size = getattr(self, '_max_company_size', 300)
+        data = self._google_search(f'"{company_name}" site:linkedin.com/company/ employees', 3)
+        if not data or not data.get('results'):
+            return ("unknown", -1)
+        def _classify(count):
+            if count > max_size: return ("skip", count)
+            elif count > 150: return ("large", count)
+            elif count >= 50: return ("medium", count)
+            else: return ("small", count)
+        for result in data['results']:
+            combined = f"{result.get('title', '')} {result.get('snippet', '')}"
+            range_match = re.search(r'(\d[\d,]*)\s*[-–]\s*(\d[\d,]*)\s*employees?', combined, re.IGNORECASE)
+            if range_match:
+                low = int(range_match.group(1).replace(',', ''))
+                high = int(range_match.group(2).replace(',', ''))
+                return _classify((low + high) // 2)
+            single_match = re.search(r'(\d[\d,]*)\+?\s*employees?', combined, re.IGNORECASE)
+            if single_match:
+                return _classify(int(single_match.group(1).replace(',', '')))
+        return ("unknown", -1)
+
+    def has_internal_recruiter(self, company_name: str) -> Tuple[bool, str]:
+        """Check if company has internal recruiter/TA via Google Search."""
+        recruiter_titles = ["recruiter", "talent acquisition", "people operations", "head of talent"]
+        titles_query = ' OR '.join(f'"{t}"' for t in recruiter_titles)
+        data = self._google_search(f'site:linkedin.com/in/ ({titles_query}) "{company_name}"', 3)
+        if not data or not data.get('results'):
+            return (False, "")
+        for result in data['results']:
+            url = result.get('url', '')
+            combined = f"{result.get('title', '')} {result.get('snippet', '')}".lower()
+            if 'linkedin.com/in/' not in url:
+                continue
+            if any(kw in combined for kw in recruiter_titles) and company_name.lower() in combined:
+                evidence = result.get('title', '')[:50]
+                return (True, evidence)
+        return (False, "")
+
     def extract_company_keywords(self, job_data: Dict) -> str:
         """
         Extract contextual keywords from job posting to improve company search accuracy.
@@ -1090,12 +1210,32 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
             logger.info(f"  ⊘ Skipping recruitment firm/confidential posting")
             return []
 
+        # Signal ③: Company Size Check (skip >max_size employees)
+        if not getattr(self, '_skip_size_check', False):
+            size_bucket, employee_count = self.estimate_company_size(company)
+            if size_bucket == "skip":
+                logger.info(f"  ⊘ SKIP: Too large ({employee_count} est. employees)")
+                self._skipped_too_large = getattr(self, '_skipped_too_large', 0) + 1
+                return []
+        else:
+            size_bucket, employee_count = "unknown", -1
+
+        # Signal ①: Recruiter Check (skip if internal recruiter found)
+        if not getattr(self, '_skip_recruiter_check', False):
+            has_recruiter, evidence = self.has_internal_recruiter(company)
+            if has_recruiter:
+                logger.info(f"  ⊘ SKIP: Internal recruiter found ({evidence})")
+                self._skipped_has_recruiter = getattr(self, '_skipped_has_recruiter', 0) + 1
+                return []
+        else:
+            has_recruiter = False
+
         # Step 1: Extract contextual keywords from job posting
         keywords = self.extract_company_keywords(job)
 
         # Step 2: Find company website (with location + industry context)
         logger.info(f"\n{'='*70}")
-        logger.info(f"🏢 Company: {company}")
+        logger.info(f"🏢 Company: {company} [{size_bucket}, ~{employee_count}emp]")
         if keywords:
             logger.info(f"  → Keywords: {keywords}")
 
@@ -1168,10 +1308,14 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
                     'company_website': website,
                     'company_domain': domain,
                     'company_description': company_desc,
+                    'employee_count_est': employee_count,
+                    'company_size_bucket': size_bucket,
                     'job_title': job.get('job_title', ''),
                     'job_url': job.get('job_url', ''),
                     'location': job.get('location', ''),
                     'posted_date': job.get('posted_date', ''),
+                    'job_age_days': job.get('job_age_days', -1),
+                    'pain_level': job.get('pain_level', 'unknown'),
                     'dm_name': '',
                     'dm_first': '',
                     'dm_last': '',
@@ -1222,10 +1366,13 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
                     return None
                 seen_names.add(full_name)
 
-            # Step 6: Validate decision-maker title
-            is_dm = self.is_decision_maker(job_title)
+            # Step 6: Validate decision-maker title (size-aware)
+            if size_bucket != "unknown":
+                is_dm = self.is_decision_maker_by_size(job_title, size_bucket)
+            else:
+                is_dm = self.is_decision_maker(job_title)
             if not is_dm:
-                logger.info(f"    ⚠ Not a decision-maker (fallback): {full_name} ({job_title})")
+                logger.info(f"    ⚠ Not a decision-maker for {size_bucket} company: {full_name} ({job_title})")
             else:
                 logger.info(f"    ★ Found DM: {full_name} ({job_title})")
 
@@ -1246,10 +1393,14 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
                 'company_website': website,
                 'company_domain': domain,
                 'company_description': company_desc,
+                'employee_count_est': employee_count,
+                'company_size_bucket': size_bucket,
                 'job_title': job.get('job_title', ''),
                 'job_url': job.get('job_url', ''),
                 'location': job.get('location', ''),
                 'posted_date': job.get('posted_date', ''),
+                'job_age_days': job.get('job_age_days', -1),
+                'pain_level': job.get('pain_level', 'unknown'),
                 'dm_name': full_name,
                 'dm_first': full_name.split()[0] if full_name else '',
                 'dm_last': ' '.join(full_name.split()[1:]) if len(full_name.split()) > 1 else '',
@@ -1355,7 +1506,8 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
             sheet_id = spreadsheet['sheets'][0]['properties']['sheetId']
 
             headers = [
-                "Company Name", "Company Type", "Company Website", "Job Title", "Job URL", "Location",
+                "Company Name", "Company Type", "Company Website", "Est. Employees", "Company Size",
+                "Job Title", "Job URL", "Location", "Job Age (Days)", "Pain Level",
                 "DM Name", "DM Title", "DM First", "DM Last", "DM LinkedIn",
                 "DM Email", "Email Status", "DM Source", "Message", "Scraped Date"
             ]
@@ -1366,9 +1518,13 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
                     row.get('company_name', ''),
                     row.get('company_type', 'Other'),
                     row.get('company_website', ''),
+                    row.get('employee_count_est', ''),
+                    row.get('company_size_bucket', ''),
                     row.get('job_title', ''),
                     row.get('job_url', ''),
                     row.get('location', ''),
+                    row.get('job_age_days', ''),
+                    row.get('pain_level', ''),
                     row.get('dm_name', ''),
                     row.get('dm_title', ''),
                     row.get('dm_first', ''),
@@ -1413,12 +1569,24 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
             logger.error(f"❌ Export failed: {e}")
             return ""
 
-    def execute(self, keyword: str, location: str = "", posted_date: str = "last14days", max_jobs: int = 10, max_pages: int = 20):
+    def execute(self, keyword: str, location: str = "", posted_date: str = "last14days", max_jobs: int = 10, max_pages: int = 20,
+                min_age: int = 0, max_size: int = 300, skip_recruiter_check: bool = False, skip_size_check: bool = False):
         start_time = time.time()
+
+        # Store config for signal checks
+        self._max_company_size = max_size
+        self._skip_recruiter_check = skip_recruiter_check
+        self._skip_size_check = skip_size_check
+        self._min_job_age = min_age
+        self._skipped_too_large = 0
+        self._skipped_has_recruiter = 0
+        self._size_counts = {'small': 0, 'medium': 0, 'large': 0, 'unknown': 0}
+        self._pain_counts = {'high': 0, 'medium': 0, 'low': 0, 'unknown': 0}
 
         print("\n" + "="*70)
         print("🚀 REED.CO.UK JOB SCRAPER & OUTREACH SYSTEM (STREAMING MODE)")
         print(f"Keyword: {keyword} | Location: {location} | Posted: {posted_date}")
+        print(f"Signals: Size≤{max_size} | Recruiter={'OFF' if skip_recruiter_check else 'ON'} | MinAge={min_age}d")
         print("="*70 + "\n")
 
         # 1. Start Scraper
@@ -1478,16 +1646,32 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
         avg_time_per_company = total_time / num_companies if num_companies else 0
         success_rate = len(jobs_with_emails) / num_companies * 100 if num_companies else 0
 
+        # Count signal stats from results
+        for j in jobs_with_emails:
+            sz = j.get('company_size_bucket', 'unknown')
+            if sz in self._size_counts:
+                self._size_counts[sz] += 1
+            pl = j.get('pain_level', 'unknown')
+            if pl in self._pain_counts:
+                self._pain_counts[pl] += 1
+
+        high_pain = self._pain_counts.get('high', 0)
+
         print("\n" + "-"*70)
         print(f"📊 PERFORMANCE METRICS:")
         print(f"   Companies Processed: {num_companies}")
-        print(f"   Decision Makers Found: {len(jobs_with_emails)} ({len(jobs_with_emails)/num_companies:.1f} per company)" if num_companies else "")
+        print(f"   Skipped (>{self._max_company_size} employees): {self._skipped_too_large}")
+        print(f"   Skipped (Internal Recruiter): {self._skipped_has_recruiter}")
+        print(f"   High Pain (30+ days): {high_pain}")
+        print(f"   Size: Small(<50): {self._size_counts['small']}, Medium(50-150): {self._size_counts['medium']}, Large(150-300): {self._size_counts['large']}")
+        if num_companies:
+            print(f"   Decision Makers Found: {len(jobs_with_emails)} ({len(jobs_with_emails)/num_companies:.1f} per company)")
         print(f"   Total Time: {total_time:.1f}s")
         print(f"   Avg Time/Company: {avg_time_per_company:.1f}s")
         print(f"   Cache Hits - Websites: {len(self._website_cache)} | Decision Makers: {len(self._dm_cache)}")
         print("-"*70 + "\n")
 
-        logger.info(f"METRICS: companies={num_companies} dms={len(jobs_with_emails)} total_time={total_time:.1f}s avg_time={avg_time_per_company:.1f}s")
+        logger.info(f"METRICS: companies={num_companies} dms={len(jobs_with_emails)} skipped_large={self._skipped_too_large} skipped_recruiter={self._skipped_has_recruiter} total_time={total_time:.1f}s")
 
         # Save CSV
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -1512,7 +1696,8 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
             notify_error()
 
     def execute_batch(self, keywords: List[str], location: str = "London", posted_date: str = "last14days",
-                      max_jobs_per_keyword: int = 50, max_pages: int = 20):
+                      max_jobs_per_keyword: int = 50, max_pages: int = 20,
+                      min_age: int = 0, max_size: int = 300, skip_recruiter_check: bool = False, skip_size_check: bool = False):
         """
         Batch execution: run multiple keywords, deduplicate companies across all,
         enrich once, export to single Google Sheet.
@@ -1520,10 +1705,21 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
         start_time = time.time()
         total_target = max_jobs_per_keyword * len(keywords)
 
+        # Store config for signal checks
+        self._max_company_size = max_size
+        self._skip_recruiter_check = skip_recruiter_check
+        self._skip_size_check = skip_size_check
+        self._min_job_age = min_age
+        self._skipped_too_large = 0
+        self._skipped_has_recruiter = 0
+        self._size_counts = {'small': 0, 'medium': 0, 'large': 0, 'unknown': 0}
+        self._pain_counts = {'high': 0, 'medium': 0, 'low': 0, 'unknown': 0}
+
         print("\n" + "="*70)
         print("🚀 REED.CO.UK BATCH JOB SCRAPER & OUTREACH SYSTEM")
         print(f"Keywords: {len(keywords)} | Jobs/keyword: {max_jobs_per_keyword} | Target: ~{total_target}")
         print(f"Location: {location} | Posted: {posted_date}")
+        print(f"Signals: Size≤{max_size} | Recruiter={'OFF' if skip_recruiter_check else 'ON'} | MinAge={min_age}d")
         print("="*70)
 
         # ── Phase 1: Start ALL Apify runs ──
@@ -1608,10 +1804,25 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
         total_time = time.time() - start_time
         avg_time = total_time / num_companies if num_companies else 0
 
+        # Count signal stats from results
+        for j in jobs_with_emails:
+            sz = j.get('company_size_bucket', 'unknown')
+            if sz in self._size_counts:
+                self._size_counts[sz] += 1
+            pl = j.get('pain_level', 'unknown')
+            if pl in self._pain_counts:
+                self._pain_counts[pl] += 1
+
+        high_pain = self._pain_counts.get('high', 0)
+
         print("\n" + "-"*70)
         print(f"📊 BATCH PERFORMANCE METRICS:")
         print(f"   Keywords Searched: {len(run_ids)}")
         print(f"   Companies Processed: {num_companies}")
+        print(f"   Skipped (>{self._max_company_size} employees): {self._skipped_too_large}")
+        print(f"   Skipped (Internal Recruiter): {self._skipped_has_recruiter}")
+        print(f"   High Pain (30+ days): {high_pain}")
+        print(f"   Size: Small(<50): {self._size_counts['small']}, Medium(50-150): {self._size_counts['medium']}, Large(150-300): {self._size_counts['large']}")
         if num_companies:
             print(f"   Decision Makers Found: {len(jobs_with_emails)} ({len(jobs_with_emails)/num_companies:.1f} per company)")
         print(f"   Total Time: {total_time:.1f}s ({total_time/60:.1f} min)")
@@ -1619,7 +1830,7 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
         print(f"   Cache Hits - Websites: {len(self._website_cache)} | Decision Makers: {len(self._dm_cache)}")
         print("-"*70 + "\n")
 
-        logger.info(f"BATCH METRICS: keywords={len(run_ids)} companies={num_companies} dms={len(jobs_with_emails)} total_time={total_time:.1f}s")
+        logger.info(f"BATCH METRICS: keywords={len(run_ids)} companies={num_companies} dms={len(jobs_with_emails)} skipped_large={self._skipped_too_large} skipped_recruiter={self._skipped_has_recruiter} total_time={total_time:.1f}s")
 
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         csv_path = f".tmp/reed_jobs_batch_{timestamp}.csv"
@@ -1656,6 +1867,10 @@ def main():
                         help='Date filter')
     parser.add_argument('--limit', type=int, default=50, help='Max jobs per keyword (default: 50)')
     parser.add_argument('--max-pages', type=int, default=20, help='Max pages to scrape')
+    parser.add_argument('--min-age', type=int, default=0, help='Min job age in days (30 = pain signal)')
+    parser.add_argument('--max-size', type=int, default=300, help='Max company size (default: 300)')
+    parser.add_argument('--no-recruiter-check', action='store_true', help='Skip recruiter detection')
+    parser.add_argument('--no-size-check', action='store_true', help='Skip company size detection')
 
     args = parser.parse_args()
 
@@ -1671,7 +1886,11 @@ def main():
                 location=args.location,
                 posted_date=args.posted_date,
                 max_jobs_per_keyword=args.limit,
-                max_pages=args.max_pages
+                max_pages=args.max_pages,
+                min_age=args.min_age,
+                max_size=args.max_size,
+                skip_recruiter_check=args.no_recruiter_check,
+                skip_size_check=args.no_size_check
             )
         elif args.keyword:
             # Single keyword mode
@@ -1680,7 +1899,11 @@ def main():
                 location=args.location,
                 posted_date=args.posted_date,
                 max_jobs=args.limit,
-                max_pages=args.max_pages
+                max_pages=args.max_pages,
+                min_age=args.min_age,
+                max_size=args.max_size,
+                skip_recruiter_check=args.no_recruiter_check,
+                skip_size_check=args.no_size_check
             )
         else:
             print("❌ Provide --keyword or --keywords")

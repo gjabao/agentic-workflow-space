@@ -574,7 +574,7 @@ class ApifyLeadScraper:
         COMPANY DATA:
         - Name: {company_name}
         - Industry: {company_industry}
-        - Description: {company_desc[:200]}
+        - Description: {(company_desc or '')[:200]}
 
         TASK: Does this company belong to any of the target industries?
 
@@ -648,7 +648,7 @@ class ApifyLeadScraper:
         
         return suggestions
 
-    def export_to_csv(self, leads: List[Dict], industry: str) -> str:
+    def export_to_csv(self, leads: List[Dict], industry: str, agency_type: str = "universal") -> str:
         """
         Export leads to CSV file as fallback when Google Sheets fails.
 
@@ -663,11 +663,12 @@ class ApifyLeadScraper:
         safe_industry = industry.replace(' ', '_').replace('/', '_')[:30]
         filename = f".tmp/leads_{safe_industry}_{timestamp}.csv"
 
+        # Dynamic headers based on agency type
+        icp_header = "Roles" if agency_type == "recruitment" else "ICP"
         headers = [
             "Company Name", "Website", "Industry", "Location", "Size", "Revenue",
             "First Name", "Last Name", "Job Title", "Email", "Email Status",
-            "Verification Status", "Icebreaker 1", "Icebreaker 2", "Icebreaker 3",
-            "Icebreaker 4",
+            "Verification Status", "Personalization", icp_header, "Their Service",
             "Phone", "LinkedIn", "Company LinkedIn"
         ]
 
@@ -689,10 +690,9 @@ class ApifyLeadScraper:
                     "Email": lead.get('email', ''),
                     "Email Status": lead.get('email_status', ''),
                     "Verification Status": lead.get('verification_status', 'Not Checked'),
-                    "Icebreaker 1": lead.get('icebreaker_1', ''),
-                    "Icebreaker 2": lead.get('icebreaker_2', ''),
-                    "Icebreaker 3": lead.get('icebreaker_3', ''),
-                    "Icebreaker 4": lead.get('icebreaker_4', ''),
+                    "Personalization": lead.get('icebreaker_1', ''),
+                    icp_header: lead.get('icebreaker_2', ''),
+                    "Their Service": lead.get('icebreaker_3', ''),
                     "Phone": lead.get('mobile_number', '') or lead.get('company_phone', ''),
                     "LinkedIn": lead.get('linkedin', ''),
                     "Company LinkedIn": lead.get('company_linkedin', '')
@@ -701,7 +701,7 @@ class ApifyLeadScraper:
         logger.info(f"✓ CSV export complete: {filename}")
         return filename
 
-    def export_to_google_sheets(self, leads: List[Dict], title: str) -> str:
+    def export_to_google_sheets(self, leads: List[Dict], title: str, agency_type: str = "universal") -> str:
         """
         Export leads to a new Google Sheet.
         
@@ -763,10 +763,12 @@ class ApifyLeadScraper:
 
             # Define headers based on the first lead or a standard schema
             # We'll use a standard schema for consistency
+            # Dynamic headers based on agency type
+            icp_header = "Roles" if agency_type == "recruitment" else "ICP"
             headers = [
                 "Company Name", "Website", "Industry", "Location", "Size", "Revenue",
                 "First Name", "Last Name", "Job Title", "Email", "Email Status", "Verification Status",
-                "Icebreaker 1", "Icebreaker 2", "Icebreaker 3", "Icebreaker 4",
+                "Personalization", icp_header, "Their Service",
                 "Phone", "LinkedIn", "Company LinkedIn"
             ]
 
@@ -789,7 +791,6 @@ class ApifyLeadScraper:
                     lead.get('icebreaker_1', ''),
                     lead.get('icebreaker_2', ''),
                     lead.get('icebreaker_3', ''),
-                    lead.get('icebreaker_4', ''),
                     lead.get('mobile_number', '') or lead.get('company_phone', ''),
                     lead.get('linkedin', ''),
                     lead.get('company_linkedin', '')
@@ -873,18 +874,19 @@ class ApifyLeadScraper:
         logger.info(f"✓ Results saved to: {filepath}")
         return filepath
     
-    def execute(self, industry: str, fetch_count: int, skip_test: bool = False, valid_only: bool = False, sender_context: str = "", **filters) -> Dict:
+    def execute(self, industry: str, fetch_count: int, skip_test: bool = False, valid_only: bool = False, sender_context: str = "", agency_type: str = "universal", **filters) -> Dict:
         """
         Execute the full scraping workflow.
-        
+
         Args:
             industry: Target industry
             fetch_count: Number of leads to fetch
             skip_test: Whether to skip the test run
             valid_only: Whether to export only valid emails
             sender_context: Context about the sender for SSM prompts
+            agency_type: One of 'recruitment', 'marketing', 'universal'
             **filters: Additional filters for the actor
-            
+
         Returns:
             Dict with execution results
         """
@@ -1043,7 +1045,7 @@ class ApifyLeadScraper:
                     logger.warning("⚠️  No valid emails found for icebreaker generation")
                 else:
                     # Run async generation (safely handles nested event loops)
-                    processed_leads = run_async(self.icebreaker_gen.generate_bulk(leads_to_process, sender_context))
+                    processed_leads = run_async(self.icebreaker_gen.generate_bulk(leads_to_process, sender_context, agency_type=agency_type))
                 
                     # Update full_leads with new icebreakers
                     # (processed_leads are references to objects in full_leads, so this might be redundant but safe)
@@ -1079,11 +1081,11 @@ class ApifyLeadScraper:
             csv_file = ""
 
             try:
-                sheet_url = self.export_to_google_sheets(leads_to_export, sheet_title)
+                sheet_url = self.export_to_google_sheets(leads_to_export, sheet_title, agency_type=agency_type)
             except Exception as sheet_error:
                 logger.warning(f"⚠️  Google Sheets export failed: {sheet_error}")
                 logger.info("📄 Falling back to CSV export...")
-                csv_file = self.export_to_csv(leads_to_export, industry)
+                csv_file = self.export_to_csv(leads_to_export, industry, agency_type=agency_type)
             
             # PHASE 4: Final Metrics
             logger.info("\n⏳ PHASE 4: Calculating metrics...")
@@ -1155,7 +1157,11 @@ class ApifyLeadScraper:
 
 
 class IcebreakerGenerator:
-    """Generates personalized icebreakers using Azure OpenAI or OpenAI with SSM SOP."""
+    """Generates personalized icebreakers using Azure OpenAI or OpenAI.
+
+    Supports 3 agency types: recruitment, marketing, universal (default).
+    Always outputs 3 pieces: Personalization, ICP, Their Service.
+    """
 
     def __init__(self, azure_endpoint: str, api_key: str, deployment_name: str, provider: str = "azure"):
         self.provider = provider
@@ -1173,9 +1179,7 @@ class IcebreakerGenerator:
         """Sanitize input text to prevent Azure content filter triggers."""
         if not text:
             return ""
-        # Remove double curly braces that might trigger jailbreak detection
         text = text.replace('{{', '').replace('}}', '')
-        # Limit length to avoid token issues
         text = text[:200]
         return text.strip()
 
@@ -1209,12 +1213,430 @@ class IcebreakerGenerator:
             result = re.sub(pattern, replacement, result, flags=re.IGNORECASE)
         return result
 
-    async def generate_bulk(self, leads: List[Dict], sender_context: str = "") -> List[Dict]:
+    def _build_recruitment_prompt(self, first_name, company_name, clean_name, job_title, industry, description) -> tuple:
+        """Build prompt for recruitment agency leads. Returns (system_msg, user_prompt)."""
+        system_msg = "You are an expert at analyzing recruitment agencies and writing personalized cold email pieces. Output ONLY the 3 pieces separated by |||. No explanations. No brackets or placeholder text."
+
+        user_prompt = f"""You are generating 3 pieces for a cold email to a recruitment agency. Use the provided data (from LinkedIn) as context.
+
+INPUT DATA:
+- First Name: {first_name}
+- Company: {company_name} (shortened: {clean_name})
+- Job Title: {job_title}
+- Industry: {industry}
+- Description: {description if description else 'recruitment services'}
+
+Output EXACTLY 3 pieces separated by "|||":
+
+=== PIECE 1: PERSONALIZATION ===
+
+Write a personalized icebreaker to be used in a cold email. Use the provided data (from LinkedIn) as context. Be succinct, casual, and use a very spartan tone of voice. Try to integrate a compliment on the agency's recruiting work, from the perspective of someone who doesn't know the details but recognizes their niche. No frills. Respond in plaintext only.
+
+Rules:
+- Write a Spartan/Laconic tone of voice
+- Keep it short, simple, and professional
+- Imply familiarity wherever possible. If you see an opportunity to imply that I like the same things, believe the same things, or want the same things as they do, go for it
+- If you see an opportunity to shorten and normalize the company name (say, XYZ instead of XYZ Recruiting), do so wherever possible. More examples: "Love AMS" instead of "Love AMS Professional Services", etc
+- No punctuation at the end
+- Use simple language - avoid corporate jargon
+- Focus on WHAT they recruit (roles/industries), not HOW they do it (process/methodology)
+- Output is "Saw you..." not "Saw {{CompanyName}}..."
+
+Follow the provided format exactly: "Saw you specialize/focus on {{specific recruiting niche or role type}}"
+
+- Keep it in plain, professional English
+- Make it sound like a real person wrote it, not a template or AI
+- Be specific about the roles or industry vertical they recruit for
+
+Example outputs (match this style):
+ex1: Saw you focus on executive search for SaaS companies
+ex2: Saw you specialize in placing senior finance roles
+ex3: Saw you focus on healthcare leadership recruiting
+ex4: Saw you specialize in filling engineering roles for startups
+ex5: Saw you focus on permanent placement for logistics companies
+ex6: Saw you specialize in recruiting C-suite talent for tech firms
+
+Analysis Priority (what to look for in LinkedIn data):
+- Job titles they commonly place (e.g., "CFO", "VP Engineering", "Operations Manager")
+- Industries they serve (e.g., "healthcare", "fintech", "logistics", "SaaS")
+- Level of roles (e.g., "executive search", "senior leadership", "mid-level", "high-volume")
+- Specialization keywords (e.g., "permanent placement", "contract staffing", "retained search")
+- Niche combinations (e.g., "tech sales roles for B2B companies")
+
+Output Guidelines:
+- If they recruit multiple role types, pick the most senior or specialized
+- If they serve multiple industries, pick the most prominent one mentioned
+- Combine role + industry when possible (e.g., "finance leaders for PE firms")
+- Use professional recruiting terms: "executive search", "placing", "recruiting", "filling"
+- Avoid generic phrases like "talent acquisition" or "staffing solutions"
+
+|||
+
+=== PIECE 2: ROLE EXTRACTION (ICP) ===
+
+You are analyzing a recruitment agency's specialization. Extract the ONE specific role they most commonly place for their clients with MAXIMUM SPECIFICITY.
+
+Context:
+This will complete the sentence:
+"I know 3 companies that need [ROLE] right now (budget approved, just need the right firm)"
+
+This is used in cold outreach to recruitment agencies - showing you have clients seeking the exact roles they specialize in placing. The more specific the role, the more credible you sound.
+
+Task:
+Identify the ONE role this agency most frequently places for their clients (not the roles they hire internally). Be AS SPECIFIC AS POSSIBLE.
+
+Analysis Priority:
+1. Look for phrases like: "we place", "we recruit", "specializing in", "executive search for", "focused on placing"
+2. Focus on their client-facing services, not internal operations
+3. Identify their niche or most common placement type
+4. If they place multiple roles, choose the most senior, specialized, or frequently mentioned
+5. Include industry qualifier when it makes the role more specific (e.g., "healthcare CFO" vs just "CFO")
+
+Output Rules:
+Length: Exactly 2-4 words
+Format:
+- Uppercase ONLY: CEO, CFO, COO, CTO, CIO, CMO, VP, SVP, EVP
+- Everything else: lowercase
+- Industry qualifiers: lowercase (e.g., "healthcare CFO", "SaaS VP sales")
+
+Style:
+- No punctuation
+- No articles (a, an, the)
+- No generic phrases: "role", "position", "executive search", "talent", "professional"
+- Be specific: "finance director" not "finance roles"
+- Add industry/function when it adds specificity
+
+Valid Examples (GOOD - specific):
+healthcare CFO, VP sales, SaaS CTO, head of operations, finance director, senior accountant, logistics manager, warehouse supervisor, tech recruiter, pharma sales rep, supply chain director
+
+Invalid Examples (BAD - too vague):
+executive search, finance roles, senior talent, leadership positions, IT talent, C-suite
+
+Special Cases:
+If executive search firm: Use C-suite or VP-level titles (CEO, CFO, CTO, VP engineering)
+If high-volume/contingent recruiting: Use mid-level or specialist titles (operations manager, sales rep, accountant)
+If RPO/embedded recruiting: Focus on most common role mentioned (software engineer, product manager)
+If industry-specific: Add industry qualifier when it creates specificity ("healthcare CFO" > "CFO" if they only do healthcare)
+
+Level Hierarchy (when choosing between multiple):
+1. C-Suite: CEO, CFO, COO, CTO, CMO, CIO
+2. EVP/SVP level
+3. VP level
+4. Director level
+5. Manager level
+6. Specialist/Individual contributor
+
+|||
+
+=== PIECE 3: THEIR SERVICE ===
+
+Based on the company data, extract ONE specific phrase describing what type of recruiting service they provide.
+
+Output Rules:
+Length: 2-5 words
+Format: All lowercase
+Style: No punctuation, no articles at start
+
+Focus on their recruiting METHOD or NICHE:
+- Type of search: "executive search", "retained search", "contingent recruiting", "contract staffing"
+- Combined with vertical when specific: "healthcare executive search", "tech contract staffing"
+- Or placement style: "permanent placement", "interim staffing", "RPO services"
+
+Valid Examples:
+executive search, retained search for tech, healthcare contract staffing, permanent placement, contingent recruiting, interim executive staffing, embedded talent acquisition
+
+CRITICAL: Output ONLY the 3 pieces separated by |||. No labels, no "PIECE 1:" prefixes, no explanations. Plain text only."""
+
+        return system_msg, user_prompt
+
+    def _build_marketing_prompt(self, first_name, company_name, clean_name, job_title, industry, description) -> tuple:
+        """Build prompt for marketing agency leads. Returns (system_msg, user_prompt)."""
+        system_msg = "You are an expert at analyzing marketing agencies and writing personalized cold email pieces. Output ONLY the 3 pieces separated by |||. No explanations. No brackets or placeholder text."
+
+        user_prompt = f"""You are generating 3 pieces for a cold email to a marketing agency. Use the provided data (from LinkedIn) as context.
+
+INPUT DATA:
+- First Name: {first_name}
+- Company: {company_name} (shortened: {clean_name})
+- Job Title: {job_title}
+- Industry: {industry}
+- Description: {description if description else 'marketing services'}
+
+Output EXACTLY 3 pieces separated by "|||":
+
+=== PIECE 1: PERSONALIZATION ===
+
+Write a personalized icebreaker to be used in a cold email. Use the provided data (from LinkedIn) as context. Be succinct, casual, and use a very spartan tone of voice. Try to integrate a compliment on the agency's work, from the perspective of someone who doesn't know the details but recognizes their focus area. No frills. Respond in plaintext only.
+
+Rules:
+- Write a Spartan/Laconic tone of voice
+- Keep it short, simple, and professional
+- Imply familiarity wherever possible. If you see an opportunity to imply that I like the same things, believe the same things, or want the same things as they do, go for it
+- If you see an opportunity to shorten and normalize the company name (say, XYZ instead of XYZ Marketing Agency), do so wherever possible. More examples: "Love AMS" instead of "Love AMS Digital", etc
+- No punctuation at the end
+- Use simple language - avoid corporate jargon
+- Focus on WHAT they do (services/deliverables), not HOW they do it (process/methodology)
+- Output is "Saw your..." not "Saw {{CompanyName}}..."
+
+Follow the provided format exactly: "Saw your {{work/portfolio/projects}} {{regarding/on/around}} {{specific service}} for {{specific client type}}"
+
+- Keep it in plain, professional English
+- Make it sound like a real person wrote it, not a template or AI
+- Use variations like "work on", "portfolio regarding", "projects around" to keep it natural
+
+Example outputs (match this style):
+ex1: Saw your portfolio regarding branding for finance companies
+ex2: Saw your work on paid social campaigns for DTC brands
+ex3: Saw your projects around content strategy for B2B SaaS
+ex4: Saw your work regarding email automation for ecommerce stores
+ex5: Saw your portfolio on performance marketing for startups
+
+|||
+
+=== PIECE 2: ICP EXTRACTION ===
+
+You are analyzing a marketing agency's target market. Extract the ONE specific type of client they most commonly serve with MAXIMUM SPECIFICITY.
+
+Context:
+This will complete the sentence in a cold email where you're offering to connect the agency with potential clients. The ICP you extract must be:
+
+DIFFERENT from what appears in the personalization line to avoid repetition
+AS SPECIFIC AS POSSIBLE to sound like you have real leads (not generic)
+Example flow:
+
+Personalization: "Saw your portfolio regarding branding for finance companies"
+Body: "I've had conversations with Series A fintech teams who need [service]"
+(NOT "finance teams" - too vague. USE "Series A fintech teams" - specific and credible)
+
+Task:
+Identify the ONE client type this agency serves with MAXIMUM SPECIFICITY. Include stage/size/sub-niche whenever possible.
+
+Analysis Priority:
+First, check the Personalization (PIECE 1) to see what language was already used
+Then extract ICP with MAXIMUM detail:
+Add funding stage: "Series A fintech teams" not "fintech companies"
+Add sub-vertical: "crypto startups" not "blockchain companies"
+Add role/function: "VP marketing at SaaS startups" not "SaaS companies"
+Add business model: "subscription box brands" not "ecommerce brands"
+Look for phrases like: "we work with", "clients include", "specializing in", "helping", "we serve"
+Prioritize SPECIFIC sub-niches over broad categories
+Choose the most granular descriptor that doesn't repeat the personalization
+
+Output Rules:
+Length: Exactly 2-5 words
+Format: All lowercase (no exceptions)
+Style:
+No punctuation
+No articles (a, an, the)
+ALWAYS include qualifiers (stage/size/sub-niche/role) when possible
+Be as specific as credibly possible
+
+Valid Examples (GOOD - specific):
+Series A fintech teams, crypto exchange startups, wealth management firms, VP marketing at SaaS startups, Shopify store owners, B2B SaaS founders, dental practice owners, subscription box brands, mobile gaming studios, wellness brand founders
+
+Invalid Examples (BAD - too vague):
+finance teams, tech companies, ecommerce brands, startups, healthcare businesses
+
+Special Cases:
+If personalization mentions broad industry - extract specific sub-vertical + stage
+"finance companies" -> "Series A fintech teams" or "crypto exchange startups"
+"tech startups" -> "B2B SaaS founders" or "mobile app developers"
+"ecommerce brands" -> "subscription box brands" or "Shopify store owners"
+If personalization mentions stage - extract specific industry vertical + role
+"early-stage startups" -> "pre-seed AI founders" or "seed-stage SaaS teams"
+If personalization mentions service type - extract client descriptor with specificity
+"paid social campaigns" -> "DTC fashion brands" or "Shopify store owners"
+
+|||
+
+=== PIECE 3: THEIR SERVICE (ACTION-ORIENTED) ===
+
+You are analyzing a marketing agency's core service offering. Extract the ONE specific service they provide using ACTION-ORIENTED language.
+
+Context:
+This will complete the sentence in a cold email where you're offering to connect the agency with potential clients. The service you extract must be:
+1. DIFFERENT from what appears in the personalization line to avoid repetition
+2. ACTION-FOCUSED to sound like a real project/need (not generic capability)
+3. AVOID overusing "hiring" - use more natural project-based language
+
+Example flow:
+- Personalization: "Saw your portfolio regarding branding for finance companies"
+- Body: "I've had conversations with Series A fintech teams who are actively looking at revamping their brand identity"
+  (NOT "need branding" - USE "revamping their brand identity" - specific action)
+
+Task:
+Identify the ONE service this agency delivers using ACTION-ORIENTED language that sounds like a real project or need.
+
+Analysis Priority:
+1. First, check the Personalization (PIECE 1) to see what service language was already used
+2. Then extract service using ACTION-FOCUSED phrasing:
+   - Use project language: "revamping their brand identity" not "brand strategy"
+   - Use building language: "building a paid social system" not "paid social"
+   - Use active needs: "looking for creative production help" not "creative services"
+   - Use outcome language: "rebuilding their email funnel" not "email automation"
+
+Look for phrases like: "we offer", "specializing in", "experts in", "delivering", "our services include"
+Choose language that sounds like a REAL PROJECT or ACTIVE NEED
+
+Output Rules:
+Length: Exactly 3-6 words
+Format: All lowercase (no exceptions)
+Style:
+No punctuation
+No articles at the start (can use "a/an/the" within phrase)
+Use ACTION verbs: revamping, building, launching, rebuilding, overhauling, looking for, scaling
+Sound like a real project or active business need
+AVOID overusing "hiring" - prioritize project-based language
+
+Valid Examples (GOOD - action-oriented):
+revamping their brand identity, building a paid social system, launching paid acquisition campaigns, rebuilding their email funnel, overhauling their content strategy, scaling their paid media, looking for creative production help, building brand strategy infrastructure, launching a rebranding project, rebuilding their organic presence
+
+Invalid Examples (BAD - too generic/static):
+brand strategy, paid social, email marketing, content creation, growth marketing
+
+Special Cases:
+If personalization mentions tactical service - extract project/building angle
+"branding" -> "revamping their brand identity"
+"paid ads" -> "launching paid acquisition campaigns"
+If personalization mentions broad category - extract specific project/action
+"content strategy" -> "overhauling their content engine"
+"email automation" -> "rebuilding their email funnel"
+If personalization mentions platform - extract project-based language
+"Meta ads" -> "scaling their paid social"
+"SEO work" -> "rebuilding their organic presence"
+
+Action Verbs to Prioritize:
+- revamping (identity/system/strategy)
+- building (system/program/infrastructure)
+- launching (campaign/project/initiative)
+- rebuilding (funnel/system/presence)
+- overhauling (strategy/approach/engine)
+- scaling (media/channels/campaigns)
+- looking for (help/partner/support) - use sparingly
+
+Action Verbs to AVOID:
+- hiring (too formal, overused)
+- bringing on (sounds like HR)
+- onboarding (too corporate)
+
+CRITICAL: Output ONLY the 3 pieces separated by |||. No labels, no "PIECE 1:" prefixes, no explanations. Plain text only."""
+
+        return system_msg, user_prompt
+
+    def _build_universal_prompt(self, first_name, company_name, clean_name, job_title, industry, description) -> tuple:
+        """Build prompt for universal/any lead type. Returns (system_msg, user_prompt)."""
+        system_msg = "You are an expert at analyzing companies and writing personalized cold email pieces. Output ONLY the 3 pieces separated by |||. No explanations. No brackets or placeholder text."
+
+        user_prompt = f"""You are generating 3 pieces for a cold email. Use the provided data (from LinkedIn) as context.
+
+INPUT DATA:
+- First Name: {first_name}
+- Company: {company_name} (shortened: {clean_name})
+- Job Title: {job_title}
+- Industry: {industry}
+- Description: {description if description else 'business services'}
+
+Output EXACTLY 3 pieces separated by "|||":
+
+=== PIECE 1: PERSONALIZATION ===
+
+Write a personalized icebreaker to be used in a cold email. Use the provided data (from LinkedIn) as context. Be succinct, casual, and use a very spartan tone of voice. Try to integrate a compliment on the company's work, from the perspective of someone who doesn't know the details but recognizes their focus area. No frills. Respond in plaintext only.
+
+Rules:
+- Write a Spartan/Laconic tone of voice
+- Keep it short, simple, and professional
+- Imply familiarity wherever possible
+- If you see an opportunity to shorten and normalize the company name (say, XYZ instead of XYZ Solutions Inc), do so wherever possible
+- No punctuation at the end
+- Use simple language - avoid corporate jargon
+- Focus on WHAT they do (services/deliverables/specialization), not HOW they do it (process/methodology)
+- Output starts with "Saw you..." or "Saw your..." depending on what sounds more natural
+
+Format options (pick whichever fits best):
+- "Saw you specialize/focus on {{specific niche or service}}"
+- "Saw your {{work/portfolio/projects}} {{regarding/on/around}} {{specific service}} for {{specific client type}}"
+
+Example outputs (match this style):
+ex1: Saw you focus on executive search for SaaS companies
+ex2: Saw your portfolio regarding branding for finance companies
+ex3: Saw you specialize in placing senior finance roles
+ex4: Saw your work on paid social campaigns for DTC brands
+ex5: Saw you focus on healthcare leadership recruiting
+ex6: Saw your projects around content strategy for B2B SaaS
+
+- Keep it in plain, professional English
+- Make it sound like a real person wrote it, not a template or AI
+- Be specific about their niche, vertical, or specialization
+
+|||
+
+=== PIECE 2: ICP EXTRACTION ===
+
+Extract the ONE specific type of client/customer they most commonly serve with MAXIMUM SPECIFICITY.
+
+This will be used in a cold email body — it must be DIFFERENT from what appears in PIECE 1 to avoid repetition.
+
+Analysis Priority:
+- Determine WHO their ideal customers/clients are (not their own industry — the businesses or people they SERVE)
+- Add qualifiers for maximum specificity: funding stage, sub-vertical, role/function, business model
+- Look for phrases like: "we work with", "clients include", "specializing in", "helping", "we serve", "we place", "we recruit"
+
+Output Rules:
+Length: Exactly 2-5 words
+Format: All lowercase (no exceptions)
+Style:
+No punctuation
+No articles (a, an, the)
+ALWAYS include qualifiers (stage/size/sub-niche/role) when possible
+Be as specific as credibly possible
+MUST be different from the language used in PIECE 1
+
+Valid Examples: Series A fintech teams, crypto exchange startups, Shopify store owners, B2B SaaS founders, dental practice owners, subscription box brands, mobile gaming studios, wellness brand founders, mid-market logistics firms
+
+Invalid Examples: finance teams, tech companies, ecommerce brands, startups, healthcare businesses
+
+|||
+
+=== PIECE 3: THEIR SERVICE (ACTION-ORIENTED) ===
+
+Extract the ONE specific service/offering they provide using ACTION-ORIENTED language.
+
+This will be used in a cold email body — it must be DIFFERENT from what appears in PIECE 1 to avoid repetition.
+
+Analysis Priority:
+- Use project language: "revamping their brand identity" not "brand strategy"
+- Use building language: "building a paid social system" not "paid social"
+- Use active needs: "looking for creative production help" not "creative services"
+- Use outcome language: "rebuilding their email funnel" not "email automation"
+
+Output Rules:
+Length: Exactly 3-6 words
+Format: All lowercase (no exceptions)
+Style:
+No punctuation
+No articles at the start (can use "a/an/the" within phrase)
+Use ACTION verbs: revamping, building, launching, rebuilding, overhauling, scaling, placing, filling, recruiting
+Sound like a real project or active business need
+MUST be different from the language used in PIECE 1
+
+Valid Examples: revamping their brand identity, building a paid social system, launching paid acquisition campaigns, rebuilding their email funnel, scaling their paid media, placing senior engineering talent, filling executive leadership roles
+
+Invalid Examples: brand strategy, paid social, email marketing, content creation, talent acquisition
+
+CRITICAL: Output ONLY the 3 pieces separated by |||. No labels, no "PIECE 1:" prefixes, no explanations. Plain text only."""
+
+        return system_msg, user_prompt
+
+    async def generate_bulk(self, leads: List[Dict], sender_context: str = "", agency_type: str = "universal") -> List[Dict]:
         """
-        Generate personalized cold email messages for a list of leads using Azure OpenAI.
-        Uses a Connector-style template that positions sender as an industry insider.
+        Generate personalized cold email pieces for a list of leads.
+
+        Args:
+            leads: List of lead dicts
+            sender_context: Context about the sender
+            agency_type: One of 'recruitment', 'marketing', 'universal'
         """
-        logger.info(f"Generating personalized messages for {len(leads)} leads...")
+        logger.info(f"Generating personalized messages for {len(leads)} leads (mode: {agency_type})...")
 
         async def process_lead(lead):
             if not lead.get('company_name') or not lead.get('job_title'):
@@ -1229,54 +1651,23 @@ class IcebreakerGenerator:
 
             # Clean company name (remove LLC, Inc, etc.)
             clean_name = company_name
-            for suffix in [' Agency', ' Inc.', ' Inc', ' LLC', ' Ltd.', ' Ltd', ' B.V.', ' BV', ' Corp.', ' Corp']:
+            for suffix in [' Agency', ' Inc.', ' Inc', ' LLC', ' Ltd.', ' Ltd', ' B.V.', ' BV', ' Corp.', ' Corp',
+                           ' Recruiting', ' Staffing', ' Search', ' Marketing', ' Digital', ' Media', ' Group',
+                           ' Partners', ' Consulting', ' Services', ' Professional Services']:
                 if clean_name.endswith(suffix):
                     clean_name = clean_name[:-len(suffix)].strip()
                     break
 
-            prompt_text = f"""You are a Connector writing personalized cold email pieces for outreach.
-
-INPUT DATA:
-- First Name: {first_name}
-- Company: {company_name} (shortened: {clean_name})
-- Job Title: {job_title}
-- Industry: {industry}
-- Description: {description if description else 'business services'}
-- Sender Context: {sender_context if sender_context else 'business development professional'}
-
-STEP 1 — INFER TARGET ICP:
-Based on the company's industry and description, determine WHO their ideal customers/clients are.
-This is NOT the company's own industry — it's the type of businesses or people they SERVE.
-Examples:
-- A "digital marketing agency" serves → "e-commerce brands" or "DTC companies"
-- A "solar installer lead gen company" serves → "residential solar installers" or "solar EPC firms"
-- A "SaaS recruiting platform" serves → "tech startups" or "engineering-heavy companies"
-- A "commercial real estate brokerage" serves → "property investors" or "retail tenants"
-
-STEP 2 — WRITE 4 PIECES using the inferred ICP. Output EXACTLY 4 pieces separated by "|||":
-
-PIECE 1: I've been tracking <target ICP> teams <what they actively do> <their service/product focus> for <a relatable business goal>. Specifically ones with <signal 1>, <signal 2>, or <signal 3>
-|||
-PIECE 2: Figured with {clean_name}'s portfolio in <their specialty> and <related service area>, you're probably already talking to the right people on the <relevant department> side
-|||
-PIECE 3: Got a list of <target ICP> <what the list contains — e.g. "partnership leads", "expansion opportunities">. Are you the right person to share it with, or do you have someone else handling <relevant function — e.g. "business development", "partnerships">?
-|||
-PIECE 4: Know this is out of left field—I've had a couple conversations recently with <target ICP group>, they need <specific service/need relevant to their world>
-
-RULES:
-- Replace ALL angle-bracket placeholders with specific, inferred values. Your output must contain ZERO angle brackets, square brackets, or curly braces
-- {clean_name} in PIECE 2 is already filled in — do NOT change it
-- PIECE 4 MUST start with "Know this is out of left field—" exactly
-- NO corporate speak: avoid "solutions," "leverage," "optimize," "streamline," "synergy"
-- Keep it conversational — like a well-connected peer, not a salesperson
-- No punctuation at the end of any piece
-- No "PIECE 1:", "PIECE 2:" prefixes — just the raw text
-- Spartan/Laconic tone — short, simple, professional
-- Imply familiarity wherever possible
-- Shorten and normalize company names
-- Use simple language — focus on WHAT they do, not HOW
-
-CRITICAL: Your output must be plain text with ALL placeholders filled in. Do NOT output any brackets, braces, or template variables. Output ONLY the 4 pieces separated by |||, nothing else."""
+            # Dispatch to the right prompt builder
+            if agency_type == "recruitment":
+                system_msg, prompt_text = self._build_recruitment_prompt(
+                    first_name, company_name, clean_name, job_title, industry, description)
+            elif agency_type == "marketing":
+                system_msg, prompt_text = self._build_marketing_prompt(
+                    first_name, company_name, clean_name, job_title, industry, description)
+            else:
+                system_msg, prompt_text = self._build_universal_prompt(
+                    first_name, company_name, clean_name, job_title, industry, description)
 
             max_attempts = 2
             raw = None
@@ -1287,11 +1678,11 @@ CRITICAL: Your output must be plain text with ALL placeholders filled in. Do NOT
                         self.client.chat.completions.create,
                         model=self.deployment_name,
                         messages=[
-                            {"role": "system", "content": "You are an expert at writing personalized Connector-style cold emails. Output ONLY the 4 pieces separated by |||. No explanations. Do NOT include any brackets or placeholder text."},
+                            {"role": "system", "content": system_msg},
                             {"role": "user", "content": prompt_text}
                         ],
                         temperature=0.7 if attempt == 0 else 0.5,
-                        max_tokens=400
+                        max_tokens=300
                     )
                     raw = response.choices[0].message.content.strip()
 
@@ -1312,19 +1703,30 @@ CRITICAL: Your output must be plain text with ALL placeholders filled in. Do NOT
                 # Strip common LLM prefixes like "PIECE 1:" or "1."
                 parts = [p.strip() for p in raw.split('|||')]
                 parts = [re.sub(r'^(PIECE\s*\d+[:\s]*|\d+[.\):\s]+)', '', p).strip() for p in parts]
+                # Strip trailing punctuation from all pieces
+                parts = [re.sub(r'[.!?,;:]+$', '', p).strip() for p in parts]
 
                 lead['icebreaker_1'] = parts[0] if len(parts) > 0 else ''
                 lead['icebreaker_2'] = parts[1] if len(parts) > 1 else ''
                 lead['icebreaker_3'] = parts[2] if len(parts) > 2 else ''
-                lead['icebreaker_4'] = parts[3] if len(parts) > 3 else ''
-                lead['icebreaker'] = f"{lead['icebreaker_1']}\n{lead['icebreaker_2']}\n{lead['icebreaker_3']}"
+                lead['icebreaker_4'] = ''
+                lead['icebreaker'] = lead['icebreaker_1']
             else:
-                # Complete fallback
-                lead['icebreaker_1'] = f"I've been tracking {industry} teams scaling their outreach for pipeline growth. Specifically ones with recent hires, new funding, or expanding into new markets"
-                lead['icebreaker_2'] = f"Figured with {clean_name}'s portfolio in {industry} and related services, you're probably already talking to the right people on the growth side"
-                lead['icebreaker_3'] = f"Got a list of {industry} companies actively looking for partners. Are you the right person to share it with, or do you have someone else handling business development?"
-                lead['icebreaker_4'] = f"Know this is out of left field—I've had a couple conversations recently with {industry} leaders, they need better partners for growth"
-                lead['icebreaker'] = f"{lead['icebreaker_1']}\n{lead['icebreaker_2']}\n{lead['icebreaker_3']}"
+                # Fallback templates per agency type
+                if agency_type == "recruitment":
+                    lead['icebreaker_1'] = f"Saw you specialize in placing {industry} professionals"
+                    lead['icebreaker_2'] = "senior manager"
+                    lead['icebreaker_3'] = "executive search"
+                elif agency_type == "marketing":
+                    lead['icebreaker_1'] = f"Saw your work regarding digital marketing for {industry} companies"
+                    lead['icebreaker_2'] = f"{industry} business owners"
+                    lead['icebreaker_3'] = "revamping their brand strategy"
+                else:
+                    lead['icebreaker_1'] = f"Saw you focus on {industry} services"
+                    lead['icebreaker_2'] = f"{industry} business owners"
+                    lead['icebreaker_3'] = "scaling their operations"
+                lead['icebreaker_4'] = ''
+                lead['icebreaker'] = lead['icebreaker_1']
 
             return lead
 
@@ -1335,7 +1737,7 @@ CRITICAL: Your output must be plain text with ALL placeholders filled in. Do NOT
             batch = leads[i:i + batch_size]
             batch_results = await asyncio.gather(*[process_lead(lead) for lead in batch])
             results.extend(batch_results)
-            
+
         return results
 
 
@@ -1482,18 +1884,21 @@ def main():
     parser.add_argument('--skip_test', action='store_true', help='Skip the test run and validation phase')
     parser.add_argument('--valid_only', action='store_true', help='Export only verified valid emails')
     parser.add_argument('--sender_context', help='Context about the sender for SSM prompts', default="")
-    
+    parser.add_argument('--agency_type', choices=['recruitment', 'marketing', 'universal'],
+                        default='universal', help='Agency type for icebreaker style (recruitment/marketing/universal)')
+
     args = parser.parse_args()
-    
+
     # Convert args to dict and remove None values
     params = {k: v for k, v in vars(args).items() if v is not None}
-    
+
     # Extract required args
     industry = params.pop('industry')
     fetch_count = params.pop('fetch_count')
     skip_test = params.pop('skip_test', False)
     valid_only = params.pop('valid_only', False)
     sender_context = params.pop('sender_context', "")
+    agency_type = params.pop('agency_type', 'universal')
     
     # Auto-expand keywords if not provided
     if 'company_keywords' not in params or not params['company_keywords']:
@@ -1510,6 +1915,7 @@ def main():
         skip_test=skip_test,
         valid_only=valid_only,
         sender_context=sender_context,
+        agency_type=agency_type,
         **params
     )
 

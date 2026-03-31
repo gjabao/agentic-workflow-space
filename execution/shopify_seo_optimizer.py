@@ -25,7 +25,8 @@ import requests
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 from dotenv import load_dotenv
-from openai import AzureOpenAI
+from openai import AzureOpenAI, OpenAI
+import anthropic
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
@@ -494,16 +495,97 @@ class SEOScorer:
 # ─── SEO Optimizer (AI) ────────────────────────────────────────────────────────
 
 class SEOOptimizer:
-    """Generates AI-optimized SEO content using Azure OpenAI."""
+    """Generates AI-optimized SEO content using Azure OpenAI, OpenAI, or Anthropic."""
 
     def __init__(self, endpoint: str, api_key: str, deployment: str, brand_voice: str):
-        self.client = AzureOpenAI(
-            azure_endpoint=endpoint,
-            api_key=api_key,
-            api_version="2024-02-15-preview"
-        )
-        self.deployment = deployment
         self.brand_voice = brand_voice
+        self.provider = None
+
+        # Try Azure OpenAI first
+        try:
+            self.client = AzureOpenAI(
+                azure_endpoint=endpoint,
+                api_key=api_key,
+                api_version="2024-02-15-preview"
+            )
+            self.deployment = deployment
+            self.provider = 'azure'
+            logger.info("✓ Using Azure OpenAI")
+        except Exception as e:
+            logger.warning(f"Azure OpenAI init failed: {e}")
+
+        # Fallback: Anthropic
+        anthropic_key = os.getenv('ANTHROPIC_API_KEY')
+        if anthropic_key:
+            self.anthropic_client = anthropic.Anthropic(api_key=anthropic_key)
+            if not self.provider:
+                self.provider = 'anthropic'
+                logger.info("✓ Using Anthropic Claude as AI provider")
+        else:
+            self.anthropic_client = None
+
+        # Fallback: OpenAI
+        openai_key = os.getenv('OPENAI_API_KEY')
+        if openai_key:
+            self.openai_client = OpenAI(api_key=openai_key)
+            if not self.provider:
+                self.provider = 'openai'
+                logger.info("✓ Using OpenAI as AI provider")
+        else:
+            self.openai_client = None
+
+    def _call_ai(self, prompt: str, title: str, _attempt: int = 0) -> Optional[Dict]:
+        """Call AI provider with auto-fallback: Azure → Anthropic → OpenAI."""
+        providers = []
+        if self.provider == 'azure':
+            providers = ['azure', 'anthropic', 'openai']
+        elif self.provider == 'anthropic':
+            providers = ['anthropic', 'openai']
+        elif self.provider == 'openai':
+            providers = ['openai', 'anthropic']
+        else:
+            providers = ['anthropic', 'openai', 'azure']
+
+        for prov in providers:
+            try:
+                if prov == 'azure' and hasattr(self, 'client'):
+                    response = self.client.chat.completions.create(
+                        model=self.deployment,
+                        messages=[{'role': 'user', 'content': prompt}],
+                        temperature=0.4,
+                        max_tokens=1500,
+                        response_format={"type": "json_object"}
+                    )
+                    return json.loads(response.choices[0].message.content)
+
+                elif prov == 'anthropic' and self.anthropic_client:
+                    response = self.anthropic_client.messages.create(
+                        model="claude-sonnet-4-20250514",
+                        max_tokens=1500,
+                        messages=[{'role': 'user', 'content': prompt + "\n\nReturn ONLY valid JSON, no markdown code blocks."}],
+                    )
+                    text = response.content[0].text.strip()
+                    # Strip markdown code block if present
+                    if text.startswith('```'):
+                        text = re.sub(r'^```(?:json)?\s*', '', text)
+                        text = re.sub(r'\s*```$', '', text)
+                    return json.loads(text)
+
+                elif prov == 'openai' and hasattr(self, 'openai_client') and self.openai_client:
+                    response = self.openai_client.chat.completions.create(
+                        model="gpt-4o",
+                        messages=[{'role': 'user', 'content': prompt}],
+                        temperature=0.4,
+                        max_tokens=1500,
+                        response_format={"type": "json_object"}
+                    )
+                    return json.loads(response.choices[0].message.content)
+
+            except Exception as e:
+                logger.warning(f"  {prov} failed for {title}: {str(e)[:80]} — trying next provider")
+                continue
+
+        return None
 
     def optimize_product(self, product: Dict) -> Dict:
         """
@@ -590,14 +672,9 @@ Return ONLY valid JSON (no markdown, no code block):
 
         for attempt in range(3):
             try:
-                response = self.client.chat.completions.create(
-                    model=self.deployment,
-                    messages=[{'role': 'user', 'content': prompt}],
-                    temperature=0.4,
-                    max_tokens=1500,
-                    response_format={"type": "json_object"}
-                )
-                result = json.loads(response.choices[0].message.content)
+                result = self._call_ai(prompt, title, attempt)
+                if result is None:
+                    continue
 
                 # Validate Health Canada compliance
                 all_text = ' '.join(str(v) for v in result.values())

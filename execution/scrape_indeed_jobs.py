@@ -544,13 +544,18 @@ class IndeedJobScraper:
                     if not self.is_web3_job(normalized_title if normalized_title else title):
                         continue
 
+                    posted_date_raw = item.get('postedAt', '')
+                    job_age_days, pain_level = self.parse_job_age(posted_date_raw)
+
                     yield {
                         'company_name': normalized_company if normalized_company else company,
                         'job_title': normalized_title if normalized_title else title,
                         'job_url': item.get('url', ''),
                         'job_description': item.get('description', ''),
-                        'posted_date': item.get('postedAt', ''),
-                        'location': item.get('location', '')
+                        'posted_date': posted_date_raw,
+                        'location': item.get('location', ''),
+                        'job_age_days': job_age_days,
+                        'pain_level': pain_level
                     }
 
                 offset += len(items)
@@ -689,6 +694,111 @@ class IndeedJobScraper:
         has_exclude = any(kw in jt_lower for kw in exclude_keywords)
 
         return has_dm and not has_exclude
+
+    def is_decision_maker_by_size(self, job_title: str, company_size: str = "medium") -> bool:
+        """Size-aware decision maker validation."""
+        if not job_title or len(job_title) < 3:
+            return False
+        jt_lower = job_title.lower()
+        exclude_keywords = ['assistant', 'junior', 'intern', 'coordinator',
+                           'trainee', 'apprentice', 'student', 'clerk']
+        if any(kw in jt_lower for kw in exclude_keywords):
+            return False
+
+        if company_size == "small":
+            dm_keywords = ['founder', 'co-founder', 'ceo', 'chief executive',
+                          'owner', 'president', 'managing director']
+        elif company_size == "medium":
+            dm_keywords = ['founder', 'co-founder', 'ceo', 'chief executive',
+                          'owner', 'president', 'managing director',
+                          'hr manager', 'human resources manager',
+                          'people lead', 'head of people', 'head of hr',
+                          'head of human resources', 'people manager',
+                          'talent manager', 'hr lead']
+        else:  # large (150-300)
+            dm_keywords = ['founder', 'co-founder', 'ceo', 'chief executive',
+                          'owner', 'president', 'managing director',
+                          'hr director', 'director of hr', 'director of human resources',
+                          'head of hr', 'head of people', 'head of human resources',
+                          'vp of people', 'vp people', 'vp hr', 'vp human resources',
+                          'chief people officer', 'cpo']
+        return any(kw in jt_lower for kw in dm_keywords)
+
+    def parse_job_age(self, posted_date_str: str) -> Tuple[int, str]:
+        """Parse job posting date and calculate age. Returns (age_days, pain_level)."""
+        if not posted_date_str:
+            return (-1, "unknown")
+        posted_str = posted_date_str.strip().lower()
+        age_days = -1
+        relative_match = re.match(r'(\d+)\s*(day|week|month|hour|minute)s?\s*ago', posted_str)
+        if relative_match:
+            num = int(relative_match.group(1))
+            unit = relative_match.group(2)
+            if unit == 'day': age_days = num
+            elif unit == 'week': age_days = num * 7
+            elif unit == 'month': age_days = num * 30
+            elif unit in ('hour', 'minute'): age_days = 0
+        else:
+            for fmt in ['%Y-%m-%d', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M:%S.%fZ', '%Y-%m-%dT%H:%M:%SZ']:
+                try:
+                    posted_date = datetime.strptime(posted_date_str.strip(), fmt)
+                    age_days = (datetime.now() - posted_date).days
+                    break
+                except ValueError:
+                    continue
+        if age_days < 0: return (age_days, "unknown")
+        elif age_days >= 30: return (age_days, "high")
+        elif age_days >= 14: return (age_days, "medium")
+        else: return (age_days, "low")
+
+    def estimate_company_size(self, company_name: str) -> Tuple[str, int]:
+        """Estimate company size from LinkedIn company page via Google Search."""
+        if not self.rapidapi_search:
+            return ("unknown", -1)
+        max_size = getattr(self, '_max_company_size', 300)
+        query = f'"{company_name}" site:linkedin.com/company/ employees'
+        data = self.rapidapi_search._rate_limited_search(query, num_results=3)
+        if not data or not data.get('results'):
+            return ("unknown", -1)
+        def _classify(count):
+            if count > max_size: return ("skip", count)
+            elif count > 150: return ("large", count)
+            elif count >= 50: return ("medium", count)
+            else: return ("small", count)
+        for result in data['results']:
+            combined = f"{result.get('title', '')} {result.get('snippet', '')}"
+            range_match = re.search(r'(\d[\d,]*)\s*[-–]\s*(\d[\d,]*)\s*employees?', combined, re.IGNORECASE)
+            if range_match:
+                low = int(range_match.group(1).replace(',', ''))
+                high = int(range_match.group(2).replace(',', ''))
+                return _classify((low + high) // 2)
+            single_match = re.search(r'(\d[\d,]*)\+?\s*employees?', combined, re.IGNORECASE)
+            if single_match:
+                return _classify(int(single_match.group(1).replace(',', '')))
+        return ("unknown", -1)
+
+    def has_internal_recruiter(self, company_name: str) -> Tuple[bool, str]:
+        """Check if company has internal recruiter/TA via Google Search."""
+        if not self.rapidapi_search:
+            return (False, "")
+        recruiter_titles = ["recruiter", "talent acquisition", "people operations", "head of talent", "people & culture", "recruiting manager", "talent partner"]
+        titles_query = ' OR '.join(f'"{t}"' for t in recruiter_titles[:4])
+        query = f'site:linkedin.com/in/ ({titles_query}) "{company_name}"'
+        data = self.rapidapi_search._rate_limited_search(query, num_results=3)
+        if not data or not data.get('results'):
+            return (False, "")
+        for result in data['results']:
+            url = result.get('url', '')
+            title = result.get('title', '')
+            snippet = result.get('snippet', '')
+            combined = f"{title} {snippet}".lower()
+            if 'linkedin.com/in/' not in url:
+                continue
+            if any(kw in combined for kw in recruiter_titles):
+                if company_name.lower() in combined:
+                    evidence = title.split(' - ')[0].strip() if ' - ' in title else title[:50]
+                    return (True, evidence)
+        return (False, "")
 
     def extract_company_keywords(self, job_data: Dict) -> str:
         """
@@ -871,7 +981,25 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
         6. Return 2-3+ DMs per company (as many as found)
         """
         company = job['company_name']
-        
+
+        # Signal ③: Company Size Check (skip >max_size employees)
+        if not getattr(self, '_skip_size_check', False):
+            size_bucket, employee_count = self.estimate_company_size(company)
+            if size_bucket == "skip":
+                logger.info(f"  ⊘ SKIP: Too large ({employee_count} est. employees)")
+                return []
+        else:
+            size_bucket, employee_count = "unknown", -1
+
+        # Signal ①: Recruiter Check (skip if internal recruiter found)
+        if not getattr(self, '_skip_recruiter_check', False):
+            has_recruiter, evidence = self.has_internal_recruiter(company)
+            if has_recruiter:
+                logger.info(f"  ⊘ SKIP: Internal recruiter found ({evidence})")
+                return []
+        else:
+            has_recruiter = False
+
         # Step 0: Detect company type
         company_type = self.detect_company_type(
             company,
@@ -884,7 +1012,7 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
 
         # Step 2: Find company website (with location + industry context)
         logger.info(f"\n{'='*70}")
-        logger.info(f"🏢 Company: {company}")
+        logger.info(f"🏢 Company: {company} [{size_bucket}, ~{employee_count}emp]")
         if keywords:
             logger.info(f"  → Keywords: {keywords}")
 
@@ -958,10 +1086,15 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
                     return None
                 seen_names.add(full_name)
 
-            # Validate decision-maker
-            if not self.is_decision_maker(job_title):
-                logger.info(f"  ✗ Not a decision-maker: {job_title}")
-                return None
+            # Validate decision-maker (size-aware)
+            if size_bucket != "unknown":
+                if not self.is_decision_maker_by_size(job_title, size_bucket):
+                    logger.info(f"  ✗ Not a decision-maker for {size_bucket} company: {job_title}")
+                    return None
+            else:
+                if not self.is_decision_maker(job_title):
+                    logger.info(f"  ✗ Not a decision-maker: {job_title}")
+                    return None
 
             # Build decision-maker record
             logger.info(f"  ★ Found DM: {full_name} ({job_title})")
@@ -983,10 +1116,14 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
                 'company_website': website,
                 'company_domain': domain,
                 'company_description': company_desc,
+                'employee_count_est': employee_count,
+                'company_size': size_bucket,
                 'job_title': job.get('job_title', ''),
                 'job_url': job.get('job_url', ''),
                 'location': job.get('location', ''),
                 'posted_date': job.get('posted_date', ''),
+                'job_age_days': job.get('job_age_days', -1),
+                'pain_level': job.get('pain_level', 'unknown'),
                 'dm_name': full_name,
                 'dm_first': full_name.split()[0] if full_name else '',
                 'dm_last': ' '.join(full_name.split()[1:]) if len(full_name.split()) > 1 else '',
@@ -1064,7 +1201,10 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
             sheet_id = spreadsheet['sheets'][0]['properties']['sheetId']
             
             headers = [
-                "Company Name", "Company Type", "Company Website", "Job Title", "Job URL", "Location",
+                "Company Name", "Company Type", "Company Website",
+                "Est. Employees", "Company Size",
+                "Job Title", "Job URL", "Location",
+                "Job Age (Days)", "Pain Level",
                 "DM Name", "DM Title", "DM First", "DM Last", "DM LinkedIn",
                 "DM Email", "Email Status", "DM Source", "Message", "Scraped Date"
             ]
@@ -1075,9 +1215,13 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
                     row.get('company_name', ''),
                     row.get('company_type', 'Other'),
                     row.get('company_website', ''),
+                    row.get('employee_count_est', ''),
+                    row.get('company_size', ''),
                     row.get('job_title', ''),
                     row.get('job_url', ''),
                     row.get('location', ''),
+                    row.get('job_age_days', ''),
+                    row.get('pain_level', ''),
                     row.get('dm_name', ''),
                     row.get('dm_title', ''),
                     row.get('dm_first', ''),
@@ -1122,12 +1266,19 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
             logger.error(f"❌ Export failed: {e}")
             return ""
 
-    def execute(self, query: str, location: str = "", country: str = "United States", max_jobs: int = 10, days_posted: int = 14):
+    def execute(self, query: str, location: str = "", country: str = "United States", max_jobs: int = 10, days_posted: int = 14,
+                min_age: int = 0, max_size: int = 300, skip_recruiter_check: bool = False, skip_size_check: bool = False):
         start_time = time.time()
 
+        # Store config flags
+        self._skip_recruiter_check = skip_recruiter_check
+        self._skip_size_check = skip_size_check
+        self._max_company_size = max_size
+
         print("\n" + "="*70)
-        print("🚀 INDEED JOB SCRAPER & OUTREACH SYSTEM (STREAMING MODE)")
+        print("🚀 INDEED JOB SCRAPER & OUTREACH SYSTEM (3-SIGNAL MODE)")
         print(f"Query: {query} | Location: {location} | Country: {country}")
+        print(f"Signals: Size<{max_size} | Recruiter Skip: {'ON' if not skip_recruiter_check else 'OFF'} | Min Age: {min_age}d")
         print("="*70 + "\n")
 
         # 1. Start Scraper
@@ -1137,26 +1288,40 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
 
         processed_jobs = []
         seen_companies = set()
-        
+        skipped_too_young = 0
+        high_pain_count = 0
+
         # 2. Stream & Process
         print(f"🔄 Streaming & Processing jobs in parallel (workers={self.MAX_WORKERS})...")
 
         with ThreadPoolExecutor(max_workers=self.MAX_WORKERS) as executor:
             futures = []
-            
+
             # Producer: Stream jobs from Apify
             for job in self.stream_jobs(run_id):
                 company = job['company_name'].lower().strip()
-                
+
                 # Deduplicate on the fly
                 if company in seen_companies:
                     continue
                 seen_companies.add(company)
-                
+
+                # Signal ②: Job age filter
+                if min_age > 0:
+                    job_age = job.get('job_age_days', -1)
+                    if 0 <= job_age < min_age:
+                        skipped_too_young += 1
+                        print(f"   ⊘ Skipped: {job['company_name']} (job only {job_age}d old)")
+                        continue
+
+                if job.get('pain_level') == 'high':
+                    high_pain_count += 1
+
                 # Consumer: Submit to thread pool
                 future = executor.submit(self.process_single_company, job)
                 futures.append(future)
-                print(f"   → Found: {job['company_name']} (Processing...)")
+                pain_tag = f" 🔥{job.get('job_age_days', '?')}d" if job.get('pain_level') == 'high' else ""
+                print(f"   → Found: {job['company_name']}{pain_tag} (Processing...)")
 
             # Wait for all to finish
             print("\n⏳ Waiting for processing to complete...")
@@ -1185,6 +1350,9 @@ Output ONLY the email body. No subject line. No explanations. Pick the version t
         print("\n" + "-"*70)
         print(f"📊 PERFORMANCE METRICS:")
         print(f"   Companies Processed: {len(processed_jobs)}")
+        if min_age > 0:
+            print(f"   Skipped (Job <{min_age}d old): {skipped_too_young}")
+        print(f"   High Pain (30+ days): {high_pain_count}")
         print(f"   Emails Found: {len(jobs_with_emails)} ({success_rate:.1f}% success rate)")
         print(f"   Total Time: {total_time:.1f}s")
         print(f"   Avg Time/Company: {avg_time_per_company:.1f}s")
@@ -1222,9 +1390,13 @@ def main():
     parser.add_argument('--country', type=str, default="United States", help='Country to scrape')
     parser.add_argument('--limit', type=int, default=10, help='Max jobs to scrape')
     parser.add_argument('--days', type=int, default=14, help='Days posted')
-    
+    parser.add_argument('--min-age', type=int, default=0, help='Min job age in days (30 = only stale/pain jobs)')
+    parser.add_argument('--max-size', type=int, default=300, help='Max company size - skip larger (default: 300)')
+    parser.add_argument('--no-recruiter-check', action='store_true', help='Skip recruiter detection')
+    parser.add_argument('--no-size-check', action='store_true', help='Skip company size detection')
+
     args = parser.parse_args()
-    
+
     try:
         scraper = IndeedJobScraper()
         scraper.execute(
@@ -1232,7 +1404,11 @@ def main():
             location=args.location,
             country=args.country,
             max_jobs=args.limit,
-            days_posted=args.days
+            days_posted=args.days,
+            min_age=args.min_age,
+            max_size=args.max_size,
+            skip_recruiter_check=args.no_recruiter_check,
+            skip_size_check=args.no_size_check
         )
     except Exception as e:
         logger.error(f"❌ Fatal error: {e}")

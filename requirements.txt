@@ -1,42 +1,42 @@
 # DO Architecture - Python Dependencies
 
 # Core dependencies
-python-dotenv>=1.0.0        # Environment variable management
-requests>=2.31.0            # HTTP requests for API calls
+python-dotenv>=1.0.0,<2.0     # Environment variable management
+requests>=2.31.0,<3.0          # HTTP requests for API calls
 
 # Apify integration
-apify-client>=1.7.0         # Apify API client
-fuzzywuzzy>=0.18.0          # Fuzzy string matching for validation
-python-Levenshtein>=0.21.0  # Speed up fuzzy matching
-openai>=1.0.0               # AI text generation
+apify-client>=1.7.0,<2.0      # Apify API client
+fuzzywuzzy>=0.18.0,<1.0       # Fuzzy string matching for validation
+python-Levenshtein>=0.21.0,<1.0  # Speed up fuzzy matching
+openai>=1.0.0,<2.0            # AI text generation
 
 # Google APIs
-google-api-python-client>=2.100.0
-google-auth-httplib2>=0.1.1
-google-auth-oauthlib>=1.1.0
+google-api-python-client>=2.100.0,<3.0
+google-auth-httplib2>=0.1.1,<1.0
+google-auth-oauthlib>=1.1.0,<2.0
 
 # Data processing
-pandas>=2.1.0               # Data manipulation
-openpyxl>=3.1.0            # Excel file handling
+pandas>=2.1.0,<3.0            # Data manipulation
+openpyxl>=3.1.0,<4.0          # Excel file handling
 
 # Web scraping
-beautifulsoup4>=4.12.0
+beautifulsoup4>=4.12.0,<5.0
 
 # RAG / Vector knowledge base
-chromadb>=0.5.0                    # Local vector database
-sentence-transformers>=2.7.0       # Free local embeddings (all-MiniLM-L6-v2)
+chromadb>=0.5.0,<1.0                   # Local vector database
+sentence-transformers>=2.7.0,<3.0      # Free local embeddings (all-MiniLM-L6-v2)
 
 # Anthropic Claude SDK (blog section writing)
-anthropic>=0.28.0
+anthropic>=0.28.0,<1.0
 
 # Rate limiting and retries
-tenacity>=8.2.0            # Retry logic with exponential backoff
+tenacity>=8.2.0,<9.0          # Retry logic with exponential backoff
 
 # Validation
-email-validator>=2.1.0     # Email format validation
+email-validator>=2.1.0,<3.0   # Email format validation
 
 # Email template generation
-jinja2>=3.1.0              # Template rendering for email sections
+jinja2>=3.1.0,<4.0            # Template rendering for email sections
 
-# Logging (optional enhancements)
-# colorlog>=6.7.0          # Colored console output
+# Web server (webhook_server.py)
+flask>=3.0.0,<4.0             # Webhook HTTP server

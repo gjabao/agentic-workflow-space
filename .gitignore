@@ -1,22 +1,35 @@
 # DO Architecture - Git Ignore Rules
 
-# Temporary files (regenerable)
+# ============================================================================
+# SECRETS & CREDENTIALS — NEVER COMMIT
+# ============================================================================
+.env
+.env.*
+*.key
+*.pem
+*.p12
+credentials.json
+token.json
+*.pickle
+.modal_webhook_url
+
+# ============================================================================
+# GENERATED & TEMPORARY FILES
+# ============================================================================
 .tmp/
+active/tmp/
+active/leads/
 *.tmp
 *.temp
 
-# Environment variables and secrets
-# NOTE: .env contains API keys and should NOT be pushed to GitHub
-.env
-.env.local
-.env.*.local
+# ============================================================================
+# DATA FILES (generated outputs)
+# ============================================================================
+*.csv
 
-# Google OAuth credentials
-# NOTE: These contain secrets and should NOT be pushed to GitHub
-credentials.json
-token.json
-
-# Python
+# ============================================================================
+# PYTHON
+# ============================================================================
 __pycache__/
 *.py[cod]
 *$py.class
@@ -38,11 +51,20 @@ wheels/
 .installed.cfg
 *.egg
 MANIFEST
+.venv/
 venv/
 env/
 ENV/
 
-# IDE
+# ============================================================================
+# NODE
+# ============================================================================
+node_modules/
+package-lock.json
+
+# ============================================================================
+# IDE & OS
+# ============================================================================
 .vscode/
 .idea/
 *.swp
@@ -50,10 +72,14 @@ ENV/
 *~
 .DS_Store
 
-# Logs
+# ============================================================================
+# LOGS
+# ============================================================================
 *.log
 logs/
 
-# Files with embedded secrets (API keys in documentation)
+# ============================================================================
+# SPECIFIC EXCLUSIONS
+# ============================================================================
 ONBOARDING_SETUP_STATUS.md
 .github/workflows/daily-monitor.yml

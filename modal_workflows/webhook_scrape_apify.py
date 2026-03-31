@@ -250,10 +250,10 @@ async def webhook_scrape_apify_leads(
     """
     import os
 
-    # Verify webhook secret if configured
+    # Verify webhook secret — REQUIRED
     webhook_secret = os.environ.get("WEBHOOK_SECRET")
-    if webhook_secret and x_webhook_secret != webhook_secret:
-        raise HTTPException(status_code=401, detail="Unauthorized: Invalid webhook secret")
+    if not webhook_secret or x_webhook_secret != webhook_secret:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
         print(f"\n{'='*60}")
@@ -289,7 +289,7 @@ async def webhook_scrape_apify_leads(
 
     except Exception as e:
         print(f"❌ Error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @web_app.post("/webhook/scrape-apify-leads-sync")
@@ -304,8 +304,9 @@ async def webhook_scrape_apify_leads_sync(
     """
     import os
 
+    # Verify webhook secret — REQUIRED
     webhook_secret = os.environ.get("WEBHOOK_SECRET")
-    if webhook_secret and x_webhook_secret != webhook_secret:
+    if not webhook_secret or x_webhook_secret != webhook_secret:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
@@ -337,7 +338,8 @@ async def webhook_scrape_apify_leads_sync(
         }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"❌ Error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # ===== Mount FastAPI App =====

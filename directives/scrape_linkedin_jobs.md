@@ -888,3 +888,16 @@ python execution/scrape_linkedin_jobs.py --query "AI Engineer" --limit 10
   - **Maintenance**: Cleaner codebase, easier to understand and maintain
   - **Net Change**: +328 lines (added 473, removed 145) - final file size ~1,436 lines
   - **Verified**: Ready for testing with 10-25 Finance & Accounting jobs
+- **2026-03-27**: **MAJOR UPGRADE - v3.0 3-Signal Qualification System**:
+  - **Signal ① Recruiter Skip**: Google Search checks LinkedIn for Recruiter/TA/People Ops at company. If found → skip company (has internal recruiting). Saves all downstream API calls.
+  - **Signal ② Job Age Parsing**: Parses `posted_date` from scrape data (no API call). Calculates age in days. 30+ days = "high" pain level. New `--min-age` flag to filter.
+  - **Signal ③ Company Size Filter + DM Targeting**: Google Search for LinkedIn company page → parse employee count. Hard filter: >300 employees = SKIP. Size-aware DM targeting:
+    - Small (<50): CEO, Founder, Owner, President
+    - Medium (50-150): HR Manager, People Lead, Head of HR + C-suite
+    - Large (150-300): HR Director, VP People, Chief People Officer + C-suite
+  - **New method `is_decision_maker_by_size()`**: Replaces generic `is_decision_maker()` with size-specific title patterns
+  - **New CLI flags**: `--min-age`, `--max-size`, `--no-recruiter-check`, `--no-size-check`
+  - **New Google Sheets columns**: Est. Employees, Company Size, Job Age (Days), Pain Level
+  - **Enhanced summary stats**: Tracks skipped companies (size/recruiter), pain distribution, size distribution
+  - **Pipeline order**: Size check → Recruiter check → Website → Emails → Size-aware DM validation
+  - **Expected impact**: Higher lead quality (no large corps, no companies with TA teams), right DM per company size
